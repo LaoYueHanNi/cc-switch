@@ -276,14 +276,15 @@ impl Database {
                 log::warn!("Periodic stream_check_logs cleanup failed: {e}");
             }
         }
-        match self.rollup_and_prune(30) {
-            Ok(deleted) => {
-                reclaimed_rows += deleted;
-            }
-            Err(e) => {
-                log::warn!("Periodic rollup_and_prune failed: {e}");
-            }
-        }
+        // Disabled: keep all detailed request logs permanently
+        // match self.rollup_and_prune(30) {
+        //     Ok(deleted) => {
+        //         reclaimed_rows += deleted;
+        //     }
+        //     Err(e) => {
+        //         log::warn!("Periodic rollup_and_prune failed: {e}");
+        //     }
+        // }
         if reclaimed_rows > 0 {
             let conn = lock_conn!(self.conn);
             if let Err(e) = conn.execute_batch("PRAGMA incremental_vacuum;") {
