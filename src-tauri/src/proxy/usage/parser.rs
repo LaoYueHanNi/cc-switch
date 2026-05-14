@@ -129,9 +129,19 @@ impl TokenUsage {
                             {
                                 usage.output_tokens = output as u32;
                             }
-                            // OpenRouter 转换后的流式响应：input_tokens 也在 message_delta 中
-                            // 如果 message_start 中没有 input_tokens，则从 message_delta 获取
-                            if usage.input_tokens == 0 {
+                            // 从 message_delta 获取 input_tokens
+                            let is_minimax = model.as_deref().map_or(false, |m| m.to_lowercase().contains("minimax"));
+                            if is_minimax {
+                                // MiniMax：message_start 的 input_tokens 不可靠，无条件用 delta 值覆盖
+                                if let Some(input) =
+                                    delta_usage.get("input_tokens").and_then(|v| v.as_u64())
+                                {
+                                    if input > 0 {
+                                        usage.input_tokens = input as u32;
+                                    }
+                                }
+                            } else if usage.input_tokens == 0 {
+                                // 非 MiniMax：message_start 中没有 input_tokens 时从 delta 获取（OpenRouter 场景）
                                 if let Some(input) =
                                     delta_usage.get("input_tokens").and_then(|v| v.as_u64())
                                 {
