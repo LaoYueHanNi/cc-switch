@@ -101,8 +101,8 @@ objc2-app-kit = { version = "0.2", features = ["NSColor"] }
 
 # Optimize release binary size to help reduce AppImage footprint
 [profile.release]
-codegen-units = 1
-lto = "thin"
+# codegen-units = 1  # Disabled: single-threaded codegen, very slow
+# lto = "thin"       # Disabled: link-time optimization adds ~10min to build
 opt-level = "s"
 # 使用 unwind 以便 panic hook 能捕获 backtrace（abort 会直接终止无法捕获）
 panic = "unwind"
