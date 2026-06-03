@@ -130,7 +130,9 @@ impl TokenUsage {
                                 usage.output_tokens = output as u32;
                             }
                             // 从 message_delta 获取 input_tokens
-                            let is_minimax = model.as_deref().map_or(false, |m| m.to_lowercase().contains("minimax"));
+                            let is_minimax = model
+                                .as_deref()
+                                .map_or(false, |m| m.to_lowercase().contains("minimax"));
                             if is_minimax {
                                 // MiniMax：message_start 的 input_tokens 不可靠，无条件用 delta 值覆盖
                                 if let Some(input) =
@@ -149,7 +151,16 @@ impl TokenUsage {
                                 }
                             }
                             // 从 message_delta 中处理缓存命中(cache_read_input_tokens)
-                            if usage.cache_read_tokens == 0 {
+                            // 与 input_tokens 对称：MiniMax 在 start 阶段把整个 prompt 都标为 cache_read，
+                            // delta 阶段才拆出真实的非缓存输入部分，因此 cache_read 也需要取 delta 值才不重复计费
+                            if is_minimax {
+                                if let Some(cache_read) = delta_usage
+                                    .get("cache_read_input_tokens")
+                                    .and_then(|v| v.as_u64())
+                                {
+                                    usage.cache_read_tokens = cache_read as u32;
+                                }
+                            } else if usage.cache_read_tokens == 0 {
                                 if let Some(cache_read) = delta_usage
                                     .get("cache_read_input_tokens")
                                     .and_then(|v| v.as_u64())
