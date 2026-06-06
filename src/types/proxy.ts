@@ -138,3 +138,39 @@ export interface AppProxyConfig {
   circuitErrorRateThreshold: number;
   circuitMinRequests: number;
 }
+
+// ====== 多 Provider 轮询模式（阶段 2） ======
+
+export type PoolStrategy =
+  | "round_robin"
+  | "weighted_random"
+  | "least_failures"
+  | "lowest_latency";
+
+export interface MultiProviderConfig {
+  multiProviderEnabled: boolean;
+  poolStrategy: PoolStrategy;
+  sessionTtlSeconds: number; // 60..=86400
+  sessionTtlSliding: boolean;
+  poolIncludeOfficial: boolean;
+}
+
+export interface ProviderPoolItem {
+  providerId: string;
+  providerName: string;
+  appType: string;
+  weight: number; // 1..=100
+  poolEnabled: boolean;
+  sortIndex: number;
+  inFailoverQueue: boolean; // 冗余展示，恒为 true
+}
+
+export interface SessionBinding {
+  sessionId: string;
+  appType: string;
+  providerId: string;
+  boundAt: number;
+  expiresAt: number;
+  lastSeenAt: number;
+  requestCount: number;
+}

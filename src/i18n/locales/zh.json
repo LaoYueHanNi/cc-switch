@@ -2298,6 +2298,37 @@
       "disabled": "启用 {{app}} 故障转移\n将立即切换到队列 P1，并在失败时自动切换到下一个"
     }
   },
+  "multiProvider": {
+    "sectionTitle": "多 Provider 轮询",
+    "enableLabel": "启用多 Provider 轮询模式",
+    "enableHint": "新 session 按策略从池中选 provider；同 session 在 TTL 内复用",
+    "failoverAutoEnabledHint": "开启此模式会自动启用故障转移队列（多 Provider 强依赖）",
+    "strategyLabel": "选择策略",
+    "strategy": {
+      "roundRobin": "严格轮询（按队列顺序均匀分配）",
+      "weightedRandom": "加权随机（按 pool_weight 比例）",
+      "leastFailures": "失败次数最少（需积累数据）",
+      "lowestLatency": "延迟最低（需积累数据）"
+    },
+    "ttlLabel": "Session 粘性 TTL：{{value}} 秒",
+    "ttlHint": "短期 session 与 provider 绑定的时间窗口（60~86400 秒）",
+    "slidingLabel": "滑动 TTL（每次命中续期）",
+    "includeOfficialLabel": "允许把官方 Provider 加入轮询池",
+    "includeOfficialHint": "默认排除官方 Provider（与 Local Routing 守卫一致）",
+    "disabledHint": "未启用：所有请求走单一 Provider 路径（当前行为）",
+    "poolNote": "已加入轮询池 ⊆ 已加入故障队列（双源同步）",
+    "poolEmpty": "池为空。从下方把 Provider 加入池，或先到故障队列启用。",
+    "poolAddHint": "可加入池（在故障队列中但未启用轮询）",
+    "add": "加入",
+    "weightHint": "权重（1~100，仅 weighted_random 生效）",
+    "bindingsTitle": "Session 绑定（{{count}} 个活跃）",
+    "bindingsEmpty": "暂无活跃 session 绑定",
+    "bindingRequestCount": "{{count}} 次请求",
+    "clearAll": "清空全部绑定",
+    "clearAllConfirm": "确定清空所有 session 绑定？",
+    "updateFailed": "保存多 Provider 配置失败",
+    "updatePoolFailed": "保存轮询池失败"
+  },
   "proxy": {
     "panel": {
       "serviceAddress": "服务地址",

@@ -2298,6 +2298,37 @@
       "disabled": "Enable {{app}} failover\nSwitches to queue P1 immediately, then falls back on failures"
     }
   },
+  "multiProvider": {
+    "sectionTitle": "Multi-Provider Polling",
+    "enableLabel": "Enable Multi-Provider Polling",
+    "enableHint": "New sessions pick a provider from the pool by strategy; same session reuses the same provider within TTL",
+    "failoverAutoEnabledHint": "Enabling this mode auto-enables the failover queue (multi-provider requires it)",
+    "strategyLabel": "Selection strategy",
+    "strategy": {
+      "roundRobin": "Round Robin (even distribution)",
+      "weightedRandom": "Weighted Random (by pool_weight)",
+      "leastFailures": "Least Failures (needs history)",
+      "lowestLatency": "Lowest Latency (needs history)"
+    },
+    "ttlLabel": "Session sticky TTL: {{value}}s",
+    "ttlHint": "Time window for short-term session → provider binding (60~86400s)",
+    "slidingLabel": "Sliding TTL (renew on each hit)",
+    "includeOfficialLabel": "Allow official providers in the polling pool",
+    "includeOfficialHint": "Official providers are excluded by default (consistent with Local Routing guard)",
+    "disabledHint": "Disabled: all requests use single-provider path (current behaviour)",
+    "poolNote": "Pool members ⊆ failover queue (dual-source sync)",
+    "poolEmpty": "Pool is empty. Add providers below, or enable failover first.",
+    "poolAddHint": "Available to add (in failover queue but not yet in pool)",
+    "add": "Add",
+    "weightHint": "Weight (1~100, only affects weighted_random)",
+    "bindingsTitle": "Session bindings ({{count}} active)",
+    "bindingsEmpty": "No active session bindings",
+    "bindingRequestCount": "{{count}} requests",
+    "clearAll": "Clear all bindings",
+    "clearAllConfirm": "Clear all session bindings?",
+    "updateFailed": "Failed to save multi-provider config",
+    "updatePoolFailed": "Failed to save pool"
+  },
   "proxy": {
     "panel": {
       "serviceAddress": "Service Address",

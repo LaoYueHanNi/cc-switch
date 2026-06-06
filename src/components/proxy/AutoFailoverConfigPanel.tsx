@@ -7,9 +7,18 @@ import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Save, Loader2, Info } from "lucide-react";
 import { toast } from "sonner";
 import { useAppProxyConfig, useUpdateAppProxyConfig } from "@/lib/query/proxy";
+import {
+  MultiProviderConfigPanel,
+} from "@/components/proxy/MultiProviderConfigPanel";
+import {
+  ProviderPoolManager,
+} from "@/components/proxy/ProviderPoolManager";
+import {
+  SessionBindingList,
+} from "@/components/proxy/SessionBindingList";
 
 export interface AutoFailoverConfigPanelProps {
-  appType: string;
+  appType: import("@/lib/api").AppId;
   disabled?: boolean;
 }
 
@@ -231,6 +240,16 @@ export function AutoFailoverConfigPanel({
             )}
           </AlertDescription>
         </Alert>
+
+        {/* 阶段 2：多 Provider 轮询模式 */}
+        <div className="rounded-lg border bg-card p-4 space-y-4">
+          <h3 className="text-sm font-semibold">
+            {t("multiProvider.sectionTitle", "多 Provider 轮询")}
+          </h3>
+          <MultiProviderConfigPanel appType={appType} disabled={disabled} />
+          <ProviderPoolManager appType={appType} disabled={disabled} />
+          <SessionBindingList appType={appType} />
+        </div>
 
         {/* 重试与超时配置 */}
         <div className="space-y-4 rounded-lg border border-white/10 bg-muted/30 p-4">
