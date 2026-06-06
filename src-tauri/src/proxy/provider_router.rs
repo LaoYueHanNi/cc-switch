@@ -11,6 +11,7 @@ use crate::proxy::multi_provider;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::RwLock;
 
 /// 供应商路由器
@@ -23,7 +24,7 @@ pub struct ProviderRouter {
     pool_counter: Arc<multi_provider::PoolCounter>,
     /// 同 session 单飞锁：(app_type, session_id) -> Mutex
     /// 防并发同 session 选到不同 provider
-    session_locks: Arc<RwLock<HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>>,
+    session_locks: Arc<RwLock<HashMap<(String, String), (Instant, Arc<tokio::sync::Mutex<()>>)>>>,
 }
 
 impl ProviderRouter {
@@ -245,6 +246,10 @@ impl ProviderRouter {
 
         let mut chain = vec![primary];
         chain.extend(fallbacks);
+
+        // 阶段 2 概率清理 session_locks（防内存累积）
+        self.maybe_cleanup_session_locks().await;
+
         Ok(chain)
     }
 
@@ -289,7 +294,7 @@ impl ProviderRouter {
             .unwrap_or(false)
     }
 
-    /// 拿同 session 的单飞锁
+    /// 拿同 session 的单飞锁（首次访问记录创建时间，便于后续清理）
     async fn acquire_session_lock(
         &self,
         app_type: &str,
@@ -298,14 +303,59 @@ impl ProviderRouter {
         let key = (app_type.to_string(), session_id.to_string());
         {
             let map = self.session_locks.read().await;
-            if let Some(m) = map.get(&key) {
+            if let Some((_, m)) = map.get(&key) {
                 return m.clone();
             }
         }
         let mut map = self.session_locks.write().await;
         map.entry(key)
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .or_insert_with(|| (Instant::now(), Arc::new(tokio::sync::Mutex::new(()))))
+            .1
             .clone()
+    }
+
+    /// 概率清理：每次 select_providers_multi 完成后 1% 触发
+    /// 删创建时间 > 10 分钟的锁（session 早过期了，留着没意义）
+    async fn maybe_cleanup_session_locks(&self) {
+        // 1% 概率
+        if !self.should_cleanup_locks() {
+            return;
+        }
+        let now = Instant::now();
+        let stale_after = std::time::Duration::from_secs(600); // 10 分钟
+        let mut to_remove: Vec<(String, String)> = Vec::new();
+        {
+            let map = self.session_locks.read().await;
+            for (k, (created, _)) in map.iter() {
+                if now.duration_since(*created) > stale_after {
+                    to_remove.push(k.clone());
+                }
+            }
+        }
+        if to_remove.is_empty() {
+            return;
+        }
+        let mut map = self.session_locks.write().await;
+        let before = map.len();
+        for k in to_remove {
+            map.remove(&k);
+        }
+        log::debug!(
+            "[multi-provider] session_locks 清理 {} 条（剩 {} 条）",
+            before - map.len(),
+            map.len()
+        );
+    }
+
+    fn should_cleanup_locks(&self) -> bool {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        thread_local! {
+            static COUNTER: AtomicU64 = const { AtomicU64::new(0) };
+        }
+        COUNTER.with(|c| {
+            let n = c.fetch_add(1, Ordering::Relaxed);
+            n % 100 == 0 // 每 100 次调用触发 1 次（约 1%）
+        })
     }
 
     /// 按策略从池中选 1 个 provider

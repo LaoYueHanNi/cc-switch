@@ -1308,6 +1308,13 @@ pub fn run() {
             commands::get_circuit_breaker_config,
             commands::update_circuit_breaker_config,
             commands::get_circuit_breaker_stats,
+            // 多 Provider 轮询模式（阶段 2）
+            commands::get_multi_provider_config,
+            commands::set_multi_provider_config,
+            commands::get_provider_pool,
+            commands::set_provider_pool,
+            commands::get_session_bindings,
+            commands::clear_session_bindings,
             // Failover queue management
             commands::get_failover_queue,
             commands::get_available_providers_for_failover,

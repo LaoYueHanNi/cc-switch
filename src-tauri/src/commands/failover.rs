@@ -97,6 +97,14 @@ pub async fn set_auto_failover_enabled(
         return Err("需要先启用该应用的代理接管，再开启故障转移".to_string());
     }
 
+    // 阶段 2 守卫：multi_provider_enabled=true 时拒绝独立关闭 auto_failover
+    // 用户应走 set_multi_provider_config 复合命令
+    if !enabled && config.multi_provider_enabled {
+        return Err(
+            "多 Provider 轮询模式已开启，必须先通过多 Provider 配置关闭它".to_string(),
+        );
+    }
+
     // 队列为空时把当前供应商自动加入作为 P1，避免用户陷入"必须先加队列才能开启"的死锁
     let mut auto_added_provider_id: Option<String> = None;
     let p1_provider_id = if enabled {

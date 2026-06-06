@@ -386,6 +386,33 @@ impl Default for LogConfig {
     }
 }
 
+/// 多 Provider 轮询配置（per-app）
+///
+/// 前端 Tauri 命令的入参/出参。
+/// 字段映射到 proxy_config 表的 5 个多 Provider 列。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MultiProviderConfig {
+    pub multi_provider_enabled: bool,
+    pub pool_strategy: String,
+    pub session_ttl_seconds: u32,
+    pub session_ttl_sliding: bool,
+    pub pool_include_official: bool,
+}
+
+/// 轮询池成员（前端 UI 展示用）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProviderPoolItem {
+    pub provider_id: String,
+    pub provider_name: String,
+    pub app_type: String,
+    pub weight: i64,
+    pub pool_enabled: bool,
+    pub sort_index: usize,
+    pub in_failover_queue: bool,
+}
+
 impl LogConfig {
     /// 将配置转换为 log::LevelFilter
     pub fn to_level_filter(&self) -> log::LevelFilter {

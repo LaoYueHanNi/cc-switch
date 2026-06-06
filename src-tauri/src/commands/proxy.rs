@@ -446,3 +446,194 @@ pub async fn get_circuit_breaker_stats(
     let _ = (state, provider_id, app_type);
     Ok(None)
 }
+
+// =============================================================================
+// 多 Provider 轮询模式（阶段 2 Tauri 命令）
+// =============================================================================
+
+/// 读多 Provider 配置（per-app）
+#[tauri::command]
+pub async fn get_multi_provider_config(
+    state: tauri::State<'_, AppState>,
+    app_type: String,
+) -> Result<MultiProviderConfig, String> {
+    let cfg = state
+        .db
+        .get_proxy_config_for_app(&app_type)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(MultiProviderConfig {
+        multi_provider_enabled: cfg.multi_provider_enabled,
+        pool_strategy: cfg.pool_strategy,
+        session_ttl_seconds: cfg.session_ttl_seconds,
+        session_ttl_sliding: cfg.session_ttl_sliding,
+        pool_include_official: cfg.pool_include_official,
+    })
+}
+
+/// 复合命令：一次事务写多 Provider 模式
+///
+/// - 校验 TTL 60..=86400
+/// - 校验 pool_strategy ∈ 合法枚举
+/// - 开启时强制 `auto_failover_enabled = true`（多 Provider 强依赖）
+/// - 关闭时不动 auto_failover（用户可能想保留故障队列）
+#[tauri::command]
+pub async fn set_multi_provider_config(
+    state: tauri::State<'_, AppState>,
+    app_type: String,
+    config: MultiProviderConfig,
+) -> Result<(), String> {
+    // 1. 校验 TTL
+    if !(60..=86400).contains(&config.session_ttl_seconds) {
+        return Err(format!(
+            "session_ttl_seconds 必须在 60..=86400 之间，收到 {}",
+            config.session_ttl_seconds
+        ));
+    }
+    // 2. 校验 strategy
+    let _ = crate::proxy::multi_provider::PoolStrategy::from_db_str(&config.pool_strategy);
+
+    // 3. 读现状
+    let mut cfg = state
+        .db
+        .get_proxy_config_for_app(&app_type)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // 4. 应用变更
+    cfg.multi_provider_enabled = config.multi_provider_enabled;
+    cfg.pool_strategy = config.pool_strategy;
+    cfg.session_ttl_seconds = config.session_ttl_seconds;
+    cfg.session_ttl_sliding = config.session_ttl_sliding;
+    cfg.pool_include_official = config.pool_include_official;
+
+    // 5. 强联动：开启 multi 时必开 auto_failover；关闭时不联动
+    if config.multi_provider_enabled && !cfg.auto_failover_enabled {
+        log::info!(
+            "[{app_type}] [MP-LINK] multi_provider_enabled=true 触发 auto_failover_enabled=true"
+        );
+        cfg.auto_failover_enabled = true;
+    }
+
+    // 6. 守卫：开启时要求已 takeover（与 v3.15.0 guardrail 一致）
+    if config.multi_provider_enabled && !cfg.enabled {
+        return Err("需要先启用该应用的代理接管，再开启多 Provider 轮询".to_string());
+    }
+
+    // 7. 关闭时清空 session_bindings（避免悬挂绑定）
+    if !config.multi_provider_enabled {
+        let n = state
+            .db
+            .clear_session_bindings_for_app(&app_type)
+            .map_err(|e| e.to_string())?;
+        if n > 0 {
+            log::info!("[{app_type}] [MP-CLEAR] 关闭多 Provider 模式，清除 {n} 条 session bindings");
+        }
+    }
+
+    state
+        .db
+        .update_proxy_config_for_app(cfg)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 读轮询池成员（pool_enabled=1 的 provider）
+#[tauri::command]
+pub async fn get_provider_pool(
+    state: tauri::State<'_, AppState>,
+    app_type: String,
+) -> Result<Vec<ProviderPoolItem>, String> {
+    let all = state
+        .db
+        .get_all_providers(&app_type)
+        .map_err(|e| e.to_string())?;
+    let mut items: Vec<ProviderPoolItem> = all
+        .into_values()
+        .filter(|p| p.pool_enabled)
+        .map(|p| ProviderPoolItem {
+            provider_id: p.id.clone(),
+            provider_name: p.name.clone(),
+            app_type: app_type.clone(),
+            weight: p.pool_weight,
+            pool_enabled: true,
+            sort_index: p.sort_index.unwrap_or(0),
+            in_failover_queue: p.in_failover_queue,
+        })
+        .collect();
+    items.sort_by_key(|i| i.sort_index);
+    Ok(items)
+}
+
+/// 批量更新轮询池成员
+///
+/// 双源真相守护：pool_enabled 和 in_failover_queue 强一致
+/// （多 Provider 池成员 ⊆ 故障队列）
+#[tauri::command]
+pub async fn set_provider_pool(
+    state: tauri::State<'_, AppState>,
+    app_type: String,
+    items: Vec<ProviderPoolItem>,
+) -> Result<(), String> {
+    // 1. 读所有 provider
+    let mut all = state
+        .db
+        .get_all_providers(&app_type)
+        .map_err(|e| e.to_string())?;
+
+    // 2. 算出 pool_enabled=true 的 id 集合
+    let pool_ids: std::collections::HashSet<String> =
+        items.iter().map(|i| i.provider_id.clone()).collect();
+
+    // 3. 写回：每个 provider 的 pool_weight + pool_enabled
+    for item in &items {
+        let Some(p) = all.get_mut(&item.provider_id) else {
+            return Err(format!("provider {} 不存在", item.provider_id));
+        };
+        // 池成员必须同时在故障队列里（v3.15.0 guardrail 强约束）
+        p.pool_weight = item.weight.max(1);
+        p.pool_enabled = true;
+        p.in_failover_queue = true; // 双源同步
+        p.sort_index = Some(item.sort_index);
+    }
+    // 池外的 provider：pool_enabled=false，**不动** in_failover_queue（用户可能手动配的）
+    for p in all.values_mut() {
+        if !pool_ids.contains(&p.id) {
+            p.pool_enabled = false;
+        }
+    }
+
+    // 4. 事务写回
+    for p in all.values() {
+        state
+            .db
+            .save_provider(&app_type, p)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// 列某 app 的所有 session 绑定（调试/UI 展示）
+#[tauri::command]
+pub async fn get_session_bindings(
+    state: tauri::State<'_, AppState>,
+    app_type: String,
+) -> Result<Vec<crate::proxy::multi_provider::SessionBinding>, String> {
+    state
+        .db
+        .list_session_bindings_for_app(&app_type)
+        .map_err(|e| e.to_string())
+}
+
+/// 清空某 app 的所有 session 绑定（紧急按钮 / 关闭 multi 时）
+#[tauri::command]
+pub async fn clear_session_bindings(
+    state: tauri::State<'_, AppState>,
+    app_type: String,
+) -> Result<usize, String> {
+    state
+        .db
+        .clear_session_bindings_for_app(&app_type)
+        .map_err(|e| e.to_string())
+}
