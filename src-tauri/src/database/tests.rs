@@ -574,6 +574,8 @@ fn dry_run_validates_schema_compatibility() {
             icon: None,
             icon_color: None,
             in_failover_queue: false,
+            pool_weight: 1,
+            pool_enabled: false,
         },
     );
 
@@ -720,6 +722,195 @@ fn model_pricing_seed_repairs_known_outdated_builtin_prices() {
         )
         .expect("query GLM price");
     assert_eq!(glm, ("9".to_string(), "9".to_string(), "9".to_string()));
+}
+
+// ====== 阶段 0 迁移 v10→v11 回归测试 ======
+
+#[test]
+fn schema_migration_v10_to_v11_adds_multi_provider_columns() {
+    let conn = Connection::open_in_memory().expect("open memory db");
+    conn.execute("PRAGMA foreign_keys = ON;", [])
+        .expect("enable foreign keys");
+
+    // 模拟 v10 库：最小可用 schema（无多 Provider 列）
+    conn.execute_batch(
+        r#"
+        CREATE TABLE providers (
+            id TEXT NOT NULL, app_type TEXT NOT NULL, name TEXT NOT NULL,
+            settings_config TEXT NOT NULL, website_url TEXT, category TEXT,
+            created_at INTEGER, sort_index INTEGER, notes TEXT, icon TEXT, icon_color TEXT,
+            meta TEXT NOT NULL DEFAULT '{}',
+            is_current BOOLEAN NOT NULL DEFAULT 0,
+            in_failover_queue BOOLEAN NOT NULL DEFAULT 0,
+            PRIMARY KEY (id, app_type)
+        );
+        CREATE TABLE proxy_config (
+            app_type TEXT PRIMARY KEY CHECK (app_type IN ('claude','codex','gemini')),
+            proxy_enabled INTEGER NOT NULL DEFAULT 0, listen_address TEXT NOT NULL DEFAULT '127.0.0.1',
+            listen_port INTEGER NOT NULL DEFAULT 15721, enable_logging INTEGER NOT NULL DEFAULT 1,
+            enabled INTEGER NOT NULL DEFAULT 0, auto_failover_enabled INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL DEFAULT 3, streaming_first_byte_timeout INTEGER NOT NULL DEFAULT 60,
+            streaming_idle_timeout INTEGER NOT NULL DEFAULT 120, non_streaming_timeout INTEGER NOT NULL DEFAULT 600,
+            circuit_failure_threshold INTEGER NOT NULL DEFAULT 4, circuit_success_threshold INTEGER NOT NULL DEFAULT 2,
+            circuit_timeout_seconds INTEGER NOT NULL DEFAULT 60, circuit_error_rate_threshold REAL NOT NULL DEFAULT 0.6,
+            circuit_min_requests INTEGER NOT NULL DEFAULT 10,
+            default_cost_multiplier TEXT NOT NULL DEFAULT '1',
+            pricing_model_source TEXT NOT NULL DEFAULT 'response',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO proxy_config (app_type) VALUES ('claude'), ('codex'), ('gemini');
+        INSERT INTO providers (id, app_type, name, settings_config) VALUES ('p1', 'claude', 'P1', '{}');
+        "#,
+    )
+    .expect("seed v10 schema");
+    Database::set_user_version(&conn, 10).expect("set user_version=10");
+
+    // 跑迁移
+    Database::create_tables_on_conn(&conn).expect("create tables");
+    Database::apply_schema_migrations_on_conn(&conn).expect("apply migrations");
+
+    // 1) 新表 session_bindings 存在
+    assert!(
+        Database::table_exists(&conn, "session_bindings").expect("check table"),
+        "session_bindings should exist after v10→v11"
+    );
+
+    // 2) proxy_config 5 个新列存在
+    for col in [
+        "multi_provider_enabled",
+        "pool_strategy",
+        "session_ttl_seconds",
+        "session_ttl_sliding",
+        "pool_include_official",
+    ] {
+        assert!(
+            Database::has_column(&conn, "proxy_config", col).expect("check column"),
+            "proxy_config.{col} should exist after v10→v11"
+        );
+    }
+
+    // 3) providers 2 个新列存在
+    for col in ["pool_weight", "pool_enabled"] {
+        assert!(
+            Database::has_column(&conn, "providers", col).expect("check column"),
+            "providers.{col} should exist after v10→v11"
+        );
+    }
+
+    // 4) 默认值正确（关键：保证 0 行为变化）
+    let mpe: i64 = conn
+        .query_row(
+            "SELECT multi_provider_enabled FROM proxy_config WHERE app_type='claude'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("read default");
+    assert_eq!(mpe, 0, "multi_provider_enabled default must be 0");
+
+    let strategy: String = conn
+        .query_row(
+            "SELECT pool_strategy FROM proxy_config WHERE app_type='claude'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("read default");
+    assert_eq!(strategy, "round_robin");
+
+    let ttl: i64 = conn
+        .query_row(
+            "SELECT session_ttl_seconds FROM proxy_config WHERE app_type='claude'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("read default");
+    assert_eq!(ttl, 3600);
+
+    let pw: i64 = conn
+        .query_row(
+            "SELECT pool_weight FROM providers WHERE id='p1' AND app_type='claude'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("read default");
+    assert_eq!(pw, 1, "pool_weight default must be 1");
+
+    let pe: i64 = conn
+        .query_row(
+            "SELECT pool_enabled FROM providers WHERE id='p1' AND app_type='claude'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("read default");
+    assert_eq!(pe, 0, "pool_enabled default must be 0");
+
+    // 5) 老数据保留
+    let p1_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM providers WHERE id='p1' AND app_type='claude'",
+            [],
+            |r| r.get(0),
+        )
+        .expect("count p1");
+    assert_eq!(p1_count, 1, "old provider data must be preserved");
+
+    // 6) user_version 推进到 11
+    assert_eq!(Database::get_user_version(&conn).expect("version"), 11);
+}
+
+#[test]
+fn schema_migration_v10_to_v11_is_idempotent() {
+    // 测的是"已经迁移到 v11 的库，create_tables + apply_schema_migrations 再跑一次不报错"
+    // 直接用 migration_v10_to_v11_adds_multi_provider_columns 那个最小可用 v10 schema
+    // 跑一遍迁移到 v11，然后再跑两次 create + migrate
+    let conn = Connection::open_in_memory().expect("open memory db");
+    conn.execute("PRAGMA foreign_keys = ON;", [])
+        .expect("enable foreign keys");
+
+    conn.execute_batch(
+        r#"
+        CREATE TABLE providers (
+            id TEXT NOT NULL, app_type TEXT NOT NULL, name TEXT NOT NULL,
+            settings_config TEXT NOT NULL, website_url TEXT, category TEXT,
+            created_at INTEGER, sort_index INTEGER, notes TEXT, icon TEXT, icon_color TEXT,
+            meta TEXT NOT NULL DEFAULT '{}',
+            is_current BOOLEAN NOT NULL DEFAULT 0,
+            in_failover_queue BOOLEAN NOT NULL DEFAULT 0,
+            PRIMARY KEY (id, app_type)
+        );
+        CREATE TABLE proxy_config (
+            app_type TEXT PRIMARY KEY CHECK (app_type IN ('claude','codex','gemini')),
+            proxy_enabled INTEGER NOT NULL DEFAULT 0, listen_address TEXT NOT NULL DEFAULT '127.0.0.1',
+            listen_port INTEGER NOT NULL DEFAULT 15721, enable_logging INTEGER NOT NULL DEFAULT 1,
+            enabled INTEGER NOT NULL DEFAULT 0, auto_failover_enabled INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL DEFAULT 3, streaming_first_byte_timeout INTEGER NOT NULL DEFAULT 60,
+            streaming_idle_timeout INTEGER NOT NULL DEFAULT 120, non_streaming_timeout INTEGER NOT NULL DEFAULT 600,
+            circuit_failure_threshold INTEGER NOT NULL DEFAULT 4, circuit_success_threshold INTEGER NOT NULL DEFAULT 2,
+            circuit_timeout_seconds INTEGER NOT NULL DEFAULT 60, circuit_error_rate_threshold REAL NOT NULL DEFAULT 0.6,
+            circuit_min_requests INTEGER NOT NULL DEFAULT 10,
+            default_cost_multiplier TEXT NOT NULL DEFAULT '1',
+            pricing_model_source TEXT NOT NULL DEFAULT 'response',
+            created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO proxy_config (app_type) VALUES ('claude'), ('codex'), ('gemini');
+        "#,
+    )
+    .expect("seed v10 schema");
+    Database::set_user_version(&conn, 10).expect("set user_version=10");
+
+    // 第一次：v10 → v11
+    Database::create_tables_on_conn(&conn).expect("first create");
+    Database::apply_schema_migrations_on_conn(&conn).expect("first migration");
+    assert_eq!(Database::get_user_version(&conn).unwrap(), 11);
+
+    // 第二次：幂等（create + migrate 都应 no-op）
+    Database::create_tables_on_conn(&conn).expect("second create (idempotent)");
+    Database::apply_schema_migrations_on_conn(&conn).expect("second migration (idempotent)");
+    assert_eq!(Database::get_user_version(&conn).unwrap(), 11);
+
+    // 第三次
+    Database::create_tables_on_conn(&conn).expect("third create (idempotent)");
+    Database::apply_schema_migrations_on_conn(&conn).expect("third migration (idempotent)");
+    assert_eq!(Database::get_user_version(&conn).unwrap(), 11);
 }
 
 #[test]

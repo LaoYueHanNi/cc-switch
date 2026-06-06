@@ -192,6 +192,25 @@ pub struct AppProxyConfig {
     pub circuit_error_rate_threshold: f64,
     /// 计算错误率的最小请求数
     pub circuit_min_requests: u32,
+    /// 多 Provider 轮询模式开关（阶段 0 引入；默认 false 保持旧行为）
+    #[serde(default)]
+    pub multi_provider_enabled: bool,
+    /// 轮询池选择策略（默认 round_robin）
+    #[serde(default)]
+    pub pool_strategy: String,
+    /// Session 粘性 TTL（秒，60..=86400）
+    #[serde(default = "default_session_ttl")]
+    pub session_ttl_seconds: u32,
+    /// 是否滑动 TTL（true=每次命中续期；false=固定过期）
+    #[serde(default)]
+    pub session_ttl_sliding: bool,
+    /// 是否允许把官方 Provider 加入轮询池
+    #[serde(default)]
+    pub pool_include_official: bool,
+}
+
+fn default_session_ttl() -> u32 {
+    3600
 }
 
 /// 整流器配置

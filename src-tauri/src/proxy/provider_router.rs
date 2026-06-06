@@ -7,6 +7,7 @@ use crate::database::Database;
 use crate::error::AppError;
 use crate::provider::Provider;
 use crate::proxy::circuit_breaker::{AllowResult, CircuitBreaker, CircuitBreakerConfig};
+use crate::proxy::multi_provider;
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -23,10 +24,30 @@ pub struct ProviderRouter {
 impl ProviderRouter {
     /// 创建新的供应商路由器
     pub fn new(db: Arc<Database>) -> Self {
+        // 阶段 0 灰度开关：启动时一次性检查并日志记录
+        if multi_provider::is_multi_provider_disabled() {
+            log::info!(
+                "[multi-provider] {} 检测到强制降级（=off），所有路由走旧路径",
+                multi_provider::ENV_DISABLE_MULTI_PROVIDER
+            );
+        }
         Self {
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+
+    /// 阶段 0 占位：判断当前 app 是否启用多 Provider 模式
+    ///
+    /// 返回 `true` 时应走新路由（多 Provider + 轮询 + 故障队列）
+    /// 返回 `false` 时走旧 `select_providers` 路径
+    ///
+    /// 阶段 0 **不**调用此方法（保持 0 行为变化）；阶段 1 在 `select_providers`
+    /// 入口判断后路由到新实现。
+    pub async fn is_multi_provider_enabled(&self, app_type: &str) -> bool {
+        multi_provider::is_multi_provider_active(&self.db, app_type)
+            .await
+            .unwrap_or(false)
     }
 
     /// 选择可用的供应商（支持故障转移）
@@ -519,5 +540,77 @@ mod tests {
         let third = router.allow_provider_request("a", "claude").await;
         assert!(third.allowed);
         assert!(third.used_half_open_permit);
+    }
+
+    // ========== 阶段 0 灰度开关回归测试 ==========
+
+    /// 阶段 0 老行为：multi_provider_enabled 默认 false，不影响 select_providers
+    #[tokio::test]
+    #[serial]
+    async fn test_multi_provider_default_is_false_and_select_providers_unchanged() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        let provider_a =
+            Provider::with_id("a".to_string(), "Provider A".to_string(), json!({}), None);
+        let provider_b =
+            Provider::with_id("b".to_string(), "Provider B".to_string(), json!({}), None);
+        db.save_provider("claude", &provider_a).unwrap();
+        db.save_provider("claude", &provider_b).unwrap();
+        db.set_current_provider("claude", "a").unwrap();
+        db.add_to_failover_queue("claude", "b").unwrap();
+
+        // 1) 默认 config：multi_provider_enabled = false
+        let cfg = db.get_proxy_config_for_app("claude").await.unwrap();
+        assert!(
+            !cfg.multi_provider_enabled,
+            "默认 multi_provider_enabled 必须为 false"
+        );
+        assert_eq!(cfg.pool_strategy, "round_robin");
+        assert_eq!(cfg.session_ttl_seconds, 3600);
+        assert!(!cfg.session_ttl_sliding);
+        assert!(!cfg.pool_include_official);
+
+        // 2) Provider 默认字段
+        let pa = db.get_provider_by_id("a", "claude").unwrap().unwrap();
+        assert!(!pa.pool_enabled);
+        assert_eq!(pa.pool_weight, 1);
+
+        // 3) 旧 select_providers 行为不变（与 test_failover_disabled_uses_current_provider 一致）
+        let router = ProviderRouter::new(db.clone());
+        let providers = router.select_providers("claude").await.unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(providers[0].id, "a");
+    }
+
+    /// 阶段 0 灰度开关：环境变量强制关闭 → is_multi_provider_enabled 返回 false
+    #[tokio::test]
+    #[serial]
+    async fn test_gray_flag_env_var_forces_off() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        // 显式设 multi_provider_enabled=true（模拟"用户在 UI 打开了"）
+        let mut cfg = db.get_proxy_config_for_app("claude").await.unwrap();
+        cfg.multi_provider_enabled = true;
+        db.update_proxy_config_for_app(cfg).await.unwrap();
+
+        // 不设环境变量时：按 DB 字段，启用
+        let router = ProviderRouter::new(db.clone());
+        assert!(router.is_multi_provider_enabled("claude").await);
+
+        // 设环境变量 = off：应被强制降级
+        let prev = env::var("CC_SWITCH_MULTI_PROVIDER").ok();
+        env::set_var("CC_SWITCH_MULTI_PROVIDER", "off");
+        // is_multi_provider_disabled 立刻生效（不依赖 ProviderRouter 实例）
+        assert!(super::multi_provider::is_multi_provider_disabled());
+        assert!(!router.is_multi_provider_enabled("claude").await);
+        // 恢复
+        match prev {
+            Some(v) => env::set_var("CC_SWITCH_MULTI_PROVIDER", v),
+            None => env::remove_var("CC_SWITCH_MULTI_PROVIDER"),
+        }
+        // 恢复后应重新读 DB
+        assert!(router.is_multi_provider_enabled("claude").await);
     }
 }

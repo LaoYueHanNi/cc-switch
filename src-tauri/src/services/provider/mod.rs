@@ -203,6 +203,8 @@ mod tests {
             icon: None,
             icon_color: None,
             in_failover_queue: false,
+            pool_weight: 1,
+            pool_enabled: false,
         }
     }
 
@@ -232,6 +234,8 @@ mod tests {
             icon: None,
             icon_color: None,
             in_failover_queue: false,
+            pool_weight: 1,
+            pool_enabled: false,
         }
     }
 
@@ -273,6 +277,8 @@ mod tests {
             icon: None,
             icon_color: None,
             in_failover_queue: false,
+            pool_weight: 1,
+            pool_enabled: false,
         }
     }
 

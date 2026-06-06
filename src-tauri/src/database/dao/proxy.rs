@@ -224,7 +224,9 @@ impl Database {
                 "SELECT app_type, enabled, auto_failover_enabled,
                         max_retries, streaming_first_byte_timeout, streaming_idle_timeout, non_streaming_timeout,
                         circuit_failure_threshold, circuit_success_threshold, circuit_timeout_seconds,
-                        circuit_error_rate_threshold, circuit_min_requests
+                        circuit_error_rate_threshold, circuit_min_requests,
+                        multi_provider_enabled, pool_strategy, session_ttl_seconds,
+                        session_ttl_sliding, pool_include_official
                  FROM proxy_config WHERE app_type = ?1",
                 [app_type],
                 |row| {
@@ -241,6 +243,13 @@ impl Database {
                         circuit_timeout_seconds: row.get::<_, i32>(9)? as u32,
                         circuit_error_rate_threshold: row.get(10)?,
                         circuit_min_requests: row.get::<_, i32>(11)? as u32,
+                        multi_provider_enabled: row.get::<_, i32>(12).unwrap_or(0) != 0,
+                        pool_strategy: row
+                            .get::<_, String>(13)
+                            .unwrap_or_else(|_| "round_robin".to_string()),
+                        session_ttl_seconds: row.get::<_, i32>(14).unwrap_or(3600) as u32,
+                        session_ttl_sliding: row.get::<_, i32>(15).unwrap_or(0) != 0,
+                        pool_include_official: row.get::<_, i32>(16).unwrap_or(0) != 0,
                     })
                 },
             )
@@ -265,6 +274,11 @@ impl Database {
                     circuit_timeout_seconds: 60,
                     circuit_error_rate_threshold: 0.6,
                     circuit_min_requests: 10,
+                    multi_provider_enabled: false,
+                    pool_strategy: "round_robin".to_string(),
+                    session_ttl_seconds: 3600,
+                    session_ttl_sliding: false,
+                    pool_include_official: false,
                 })
             }
             Err(e) => Err(AppError::Database(e.to_string())),
@@ -291,6 +305,11 @@ impl Database {
                 circuit_timeout_seconds = ?10,
                 circuit_error_rate_threshold = ?11,
                 circuit_min_requests = ?12,
+                multi_provider_enabled = ?13,
+                pool_strategy = ?14,
+                session_ttl_seconds = ?15,
+                session_ttl_sliding = ?16,
+                pool_include_official = ?17,
                 updated_at = datetime('now')
              WHERE app_type = ?1",
             rusqlite::params![
@@ -306,6 +325,11 @@ impl Database {
                 config.circuit_timeout_seconds as i32,
                 config.circuit_error_rate_threshold,
                 config.circuit_min_requests as i32,
+                if config.multi_provider_enabled { 1 } else { 0 },
+                config.pool_strategy,
+                config.session_ttl_seconds as i32,
+                if config.session_ttl_sliding { 1 } else { 0 },
+                if config.pool_include_official { 1 } else { 0 },
             ],
         )
         .map_err(|e| AppError::Database(e.to_string()))?;

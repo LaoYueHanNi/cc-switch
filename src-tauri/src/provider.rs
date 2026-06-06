@@ -40,6 +40,20 @@ pub struct Provider {
     #[serde(default)]
     #[serde(rename = "inFailoverQueue")]
     pub in_failover_queue: bool,
+    /// 多 Provider 轮询权重（仅 pool_enabled=1 时生效；默认 1 等价轮询）
+    /// 阶段 0 引入，DB 列由 migration_v10_to_v11 创建
+    #[serde(default, skip_serializing_if = "is_default_pool_weight")]
+    #[serde(rename = "poolWeight")]
+    pub pool_weight: i64,
+    /// 是否加入多 Provider 轮询池
+    /// 阶段 0 引入；默认 false，老用户 0 行为变化
+    #[serde(default)]
+    #[serde(rename = "poolEnabled")]
+    pub pool_enabled: bool,
+}
+
+fn is_default_pool_weight(w: &i64) -> bool {
+    *w == 1
 }
 
 impl Provider {
@@ -63,6 +77,8 @@ impl Provider {
             icon: None,
             icon_color: None,
             in_failover_queue: false,
+            pool_weight: 1,
+            pool_enabled: false,
         }
     }
 
@@ -697,6 +713,8 @@ impl UniversalProvider {
             icon: self.icon.clone(),
             icon_color: self.icon_color.clone(),
             in_failover_queue: false,
+            pool_weight: 1,
+            pool_enabled: false,
         })
     }
 
@@ -762,6 +780,8 @@ requires_openai_auth = true"#
             icon: self.icon.clone(),
             icon_color: self.icon_color.clone(),
             in_failover_queue: false,
+            pool_weight: 1,
+            pool_enabled: false,
         })
     }
 
@@ -797,6 +817,8 @@ requires_openai_auth = true"#
             icon: self.icon.clone(),
             icon_color: self.icon_color.clone(),
             in_failover_queue: false,
+            pool_weight: 1,
+            pool_enabled: false,
         })
     }
 }

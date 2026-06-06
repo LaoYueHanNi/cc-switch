@@ -39,6 +39,8 @@ impl Database {
                 meta TEXT NOT NULL DEFAULT '{}',
                 is_current BOOLEAN NOT NULL DEFAULT 0,
                 in_failover_queue BOOLEAN NOT NULL DEFAULT 0,
+                pool_weight INTEGER NOT NULL DEFAULT 1,
+                pool_enabled BOOLEAN NOT NULL DEFAULT 0,
                 PRIMARY KEY (id, app_type)
             )",
             [],
@@ -133,6 +135,11 @@ impl Database {
             circuit_min_requests INTEGER NOT NULL DEFAULT 10,
             default_cost_multiplier TEXT NOT NULL DEFAULT '1',
             pricing_model_source TEXT NOT NULL DEFAULT 'response',
+            multi_provider_enabled INTEGER NOT NULL DEFAULT 0,
+            pool_strategy TEXT NOT NULL DEFAULT 'round_robin',
+            session_ttl_seconds INTEGER NOT NULL DEFAULT 3600,
+            session_ttl_sliding INTEGER NOT NULL DEFAULT 0,
+            pool_include_official INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         )", []).map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -341,6 +348,80 @@ impl Database {
             "BOOLEAN NOT NULL DEFAULT 0",
         )?;
 
+        // v10 -> v11 引入的多 Provider 列（保证全新安装也包含）
+        Self::add_column_if_missing(
+            conn,
+            "providers",
+            "pool_weight",
+            "INTEGER NOT NULL DEFAULT 1",
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "providers",
+            "pool_enabled",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+
+        if Self::table_exists(conn, "proxy_config")? {
+            Self::add_column_if_missing(
+                conn,
+                "proxy_config",
+                "multi_provider_enabled",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            Self::add_column_if_missing(
+                conn,
+                "proxy_config",
+                "pool_strategy",
+                "TEXT NOT NULL DEFAULT 'round_robin'",
+            )?;
+            Self::add_column_if_missing(
+                conn,
+                "proxy_config",
+                "session_ttl_seconds",
+                "INTEGER NOT NULL DEFAULT 3600",
+            )?;
+            Self::add_column_if_missing(
+                conn,
+                "proxy_config",
+                "session_ttl_sliding",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            Self::add_column_if_missing(
+                conn,
+                "proxy_config",
+                "pool_include_official",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+
+        // session_bindings 新表（全新安装也建）
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS session_bindings (
+                session_id     TEXT PRIMARY KEY,
+                app_type       TEXT NOT NULL,
+                provider_id    TEXT NOT NULL,
+                bound_at       INTEGER NOT NULL,
+                expires_at     INTEGER NOT NULL,
+                last_seen_at   INTEGER NOT NULL,
+                request_count  INTEGER NOT NULL DEFAULT 1
+            )",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建 session_bindings 表失败: {e}")))?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sb_app
+             ON session_bindings(app_type)",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建 idx_sb_app 失败: {e}")))?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sb_expires
+             ON session_bindings(expires_at)",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建 idx_sb_expires 失败: {e}")))?;
+
         // 删除旧的 failover_queue 表（如果存在）
         let _ = conn.execute("DROP INDEX IF EXISTS idx_failover_queue_order", []);
         let _ = conn.execute("DROP TABLE IF EXISTS failover_queue", []);
@@ -430,6 +511,11 @@ impl Database {
                         log::info!("迁移数据库从 v9 到 v10（添加 Hermes Agent 支持）");
                         Self::migrate_v9_to_v10(conn)?;
                         Self::set_user_version(conn, 10)?;
+                    }
+                    10 => {
+                        log::info!("迁移数据库从 v10 到 v11（多 Provider 轮询：session_bindings + 扩展列）");
+                        Self::migrate_v10_to_v11(conn)?;
+                        Self::set_user_version(conn, 11)?;
                     }
                     _ => {
                         return Err(AppError::Database(format!(
@@ -759,6 +845,11 @@ impl Database {
             circuit_min_requests INTEGER NOT NULL DEFAULT 10,
             default_cost_multiplier TEXT NOT NULL DEFAULT '1',
             pricing_model_source TEXT NOT NULL DEFAULT 'response',
+            multi_provider_enabled INTEGER NOT NULL DEFAULT 0,
+            pool_strategy TEXT NOT NULL DEFAULT 'round_robin',
+            session_ttl_seconds INTEGER NOT NULL DEFAULT 3600,
+            session_ttl_sliding INTEGER NOT NULL DEFAULT 0,
+            pool_include_official INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT (datetime('now')), updated_at TEXT NOT NULL DEFAULT (datetime('now'))
         )", [])?;
 
@@ -1197,6 +1288,94 @@ impl Database {
         }
 
         log::info!("v9 -> v10 迁移完成：已添加 Hermes Agent 支持");
+        Ok(())
+    }
+
+    /// v10 -> v11 迁移：多 Provider 轮询支持
+    ///
+    /// 1. 新表 `session_bindings`：短期 session → provider 粘性
+    /// 2. `proxy_config` 扩展 5 列：multi_provider_enabled / pool_strategy / session_ttl_*
+    /// 3. `providers` 扩展 2 列：pool_weight / pool_enabled
+    ///
+    /// 全部使用 add_column_if_missing + CREATE TABLE IF NOT EXISTS，保证幂等。
+    /// 默认值使所有新增列/表对老用户 0 行为变化（multi_provider_enabled=0 等价老逻辑）。
+    fn migrate_v10_to_v11(conn: &Connection) -> Result<(), AppError> {
+        // 1. 新表 session_bindings
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS session_bindings (
+                session_id     TEXT PRIMARY KEY,
+                app_type       TEXT NOT NULL,
+                provider_id    TEXT NOT NULL,
+                bound_at       INTEGER NOT NULL,
+                expires_at     INTEGER NOT NULL,
+                last_seen_at   INTEGER NOT NULL,
+                request_count  INTEGER NOT NULL DEFAULT 1
+            )",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建 session_bindings 表失败: {e}")))?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sb_app
+             ON session_bindings(app_type)",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建 idx_sb_app 失败: {e}")))?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sb_expires
+             ON session_bindings(expires_at)",
+            [],
+        )
+        .map_err(|e| AppError::Database(format!("创建 idx_sb_expires 失败: {e}")))?;
+
+        // 2. proxy_config 扩展列
+        if Self::table_exists(conn, "proxy_config")? {
+            Self::add_column_if_missing(
+                conn,
+                "proxy_config",
+                "multi_provider_enabled",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            Self::add_column_if_missing(
+                conn,
+                "proxy_config",
+                "pool_strategy",
+                "TEXT NOT NULL DEFAULT 'round_robin'",
+            )?;
+            Self::add_column_if_missing(
+                conn,
+                "proxy_config",
+                "session_ttl_seconds",
+                "INTEGER NOT NULL DEFAULT 3600",
+            )?;
+            Self::add_column_if_missing(
+                conn,
+                "proxy_config",
+                "session_ttl_sliding",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+            Self::add_column_if_missing(
+                conn,
+                "proxy_config",
+                "pool_include_official",
+                "INTEGER NOT NULL DEFAULT 0",
+            )?;
+        }
+
+        // 3. providers 扩展列
+        Self::add_column_if_missing(
+            conn,
+            "providers",
+            "pool_weight",
+            "INTEGER NOT NULL DEFAULT 1",
+        )?;
+        Self::add_column_if_missing(
+            conn,
+            "providers",
+            "pool_enabled",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+
+        log::info!("v10 -> v11 迁移完成：多 Provider 轮询基础设施就位（默认关闭，零行为变化）");
         Ok(())
     }
 
