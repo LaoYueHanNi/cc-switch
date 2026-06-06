@@ -42,7 +42,7 @@ pub struct Provider {
     pub in_failover_queue: bool,
     /// 多 Provider 轮询权重（仅 pool_enabled=1 时生效；默认 1 等价轮询）
     /// 阶段 0 引入，DB 列由 migration_v10_to_v11 创建
-    #[serde(default, skip_serializing_if = "is_default_pool_weight")]
+    #[serde(default = "default_pool_weight", skip_serializing_if = "is_default_pool_weight")]
     #[serde(rename = "poolWeight")]
     pub pool_weight: i64,
     /// 是否加入多 Provider 轮询池
@@ -54,6 +54,10 @@ pub struct Provider {
 
 fn is_default_pool_weight(w: &i64) -> bool {
     *w == 1
+}
+
+fn default_pool_weight() -> i64 {
+    1
 }
 
 impl Provider {
@@ -1464,6 +1468,47 @@ mod tests {
         assert_eq!(
             p.resolve_usage_credentials(&AppType::Claude),
             (String::new(), String::new())
+        );
+    }
+
+    /// 回归测试：反序列化时缺 poolWeight 字段应得 1 而非 0
+    /// 阶段 0 review 反馈：#[serde(default)] 不带函数 = i64::default() = 0，
+    /// 修正后用 default_pool_weight() = 1。
+    #[test]
+    fn deserialize_missing_pool_weight_defaults_to_1() {
+        let json = r#"{
+            "id": "p1",
+            "name": "P1",
+            "settingsConfig": {}
+        }"#;
+        let p: Provider = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(
+            p.pool_weight, 1,
+            "缺 poolWeight 字段时应得 1（与 DB 默认值 + 行为一致）"
+        );
+    }
+
+    #[test]
+    fn deserialize_explicit_pool_weight_zero_is_preserved() {
+        // 用户显式设 0 时，serde 必须尊重（即使不推荐）
+        let json = r#"{
+            "id": "p1",
+            "name": "P1",
+            "settingsConfig": {},
+            "poolWeight": 0
+        }"#;
+        let p: Provider = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(p.pool_weight, 0, "显式 0 必须保留（不是默认值）");
+    }
+
+    #[test]
+    fn serialize_default_pool_weight_omitted_from_json() {
+        // 默认 1 不出现在序列化结果中（skip_serializing_if = is_default_pool_weight）
+        let p = Provider::with_id("p1".to_string(), "P1".to_string(), json!({}), None);
+        let s = serde_json::to_string(&p).expect("serialize");
+        assert!(
+            !s.contains("poolWeight"),
+            "默认 poolWeight=1 应被 omit；实际: {s}"
         );
     }
 }
