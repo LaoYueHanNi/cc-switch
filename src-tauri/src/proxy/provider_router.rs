@@ -19,6 +19,11 @@ pub struct ProviderRouter {
     db: Arc<Database>,
     /// 熔断器管理器 - key 格式: "app_type:provider_id"
     circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
+    /// 轮询计数器（per-app AtomicU64，纯内存）
+    pool_counter: Arc<multi_provider::PoolCounter>,
+    /// 同 session 单飞锁：(app_type, session_id) -> Mutex
+    /// 防并发同 session 选到不同 provider
+    session_locks: Arc<RwLock<HashMap<(String, String), Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl ProviderRouter {
@@ -34,6 +39,8 @@ impl ProviderRouter {
         Self {
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
+            pool_counter: Arc::new(multi_provider::PoolCounter::new()),
+            session_locks: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -41,21 +48,36 @@ impl ProviderRouter {
     ///
     /// 返回 `true` 时应走新路由（多 Provider + 轮询 + 故障队列）
     /// 返回 `false` 时走旧 `select_providers` 路径
-    ///
-    /// 阶段 0 **不**调用此方法（保持 0 行为变化）；阶段 1 在 `select_providers`
-    /// 入口判断后路由到新实现。
     pub async fn is_multi_provider_enabled(&self, app_type: &str) -> bool {
         multi_provider::is_multi_provider_active(&self.db, app_type)
             .await
             .unwrap_or(false)
     }
 
-    /// 选择可用的供应商（支持故障转移）
+    /// 顶层入口：选择可用 Provider（按 multi_provider_enabled 分流）
     ///
-    /// 返回按优先级排序的可用供应商列表：
-    /// - 故障转移关闭时：仅返回当前供应商
-    /// - 故障转移开启时：仅使用故障转移队列，按队列顺序依次尝试（P1 → P2 → ...）
-    pub async fn select_providers(&self, app_type: &str) -> Result<Vec<Provider>, AppError> {
+    /// - `multi_provider_enabled=false` ⇒ 委托 `select_providers_legacy`（0 行为变化）
+    /// - `multi_provider_enabled=true`  ⇒ 三层决策（session 命中 / 池选 primary / 失败返 Err）
+    ///
+    /// 返回值永远是 `Vec<Provider>`（按 primary → fallbacks 顺序），
+    /// 调用方（handler_context）只需 `.first()`，无需感知 Session 粘性细节。
+    pub async fn select_providers(
+        &self,
+        app_type: &str,
+        session_id: Option<&str>,
+    ) -> Result<Vec<Provider>, AppError> {
+        // 1. 灰度开关 / DB 字段判定
+        if !self.is_multi_provider_enabled(app_type).await {
+            return self.select_providers_legacy(app_type).await;
+        }
+
+        // 2. 多 Provider 模式：三层决策
+        // 池空/全熔断时不降级 legacy——legacy 在相同配置下也会失败，徒增开销。
+        self.select_providers_multi(app_type, session_id).await
+    }
+
+    /// 旧 select_providers 实现，0 行为变化（被 select_providers 委托）
+    async fn select_providers_legacy(&self, app_type: &str) -> Result<Vec<Provider>, AppError> {
         let mut result = Vec::new();
         let mut total_providers = 0usize;
         let mut circuit_open_count = 0usize;
@@ -127,6 +149,237 @@ impl ProviderRouter {
         }
 
         Ok(result)
+    }
+
+    /// 多 Provider 模式：从 session_bindings 命中或轮询池选 primary
+    async fn select_providers_multi(
+        &self,
+        app_type: &str,
+        session_id: Option<&str>,
+    ) -> Result<Vec<Provider>, AppError> {
+        // 拿同 session 单飞锁，避免并发请求选到不同 provider
+        let _guard = if let Some(sid) = session_id {
+            Some(self.acquire_session_lock(app_type, sid).await)
+        } else {
+            None
+        };
+
+        // Layer 1: session_id 命中
+        if let Some(sid) = session_id {
+            if let Some(bound) = self.db.get_session_binding(sid).map_err(AppError::from)? {
+                if bound.app_type == app_type
+                    && bound.expires_at > multi_provider::unix_now()
+                {
+                    // 二次校验：绑定的 provider 仍存在 + 在池中 + 熔断器允许
+                    if let Some(p) = self
+                        .db
+                        .get_provider_by_id(&bound.provider_id, app_type)
+                        .map_err(AppError::from)?
+                    {
+                        if p.pool_enabled
+                            && self
+                                .is_circuit_available(app_type, &p.id)
+                                .await
+                        {
+                            self.db.touch_session_binding(sid).map_err(AppError::from)?;
+                            log::debug!(
+                                "[{app_type}] [MP-HIT] session={sid} 命中绑定 provider={}",
+                                p.id
+                            );
+                            // SessionBound 模式下，fallback 链是除 primary 外的池成员
+                            let fallbacks = self.load_pool_fallbacks(app_type, &p.id).await?;
+                            let mut chain = vec![p];
+                            chain.extend(fallbacks);
+                            return Ok(chain);
+                        }
+                        log::debug!(
+                            "[{app_type}] [MP-STALE] session={sid} 绑定失效（provider={} pool_enabled={} circuit_open={}），重新选",
+                            bound.provider_id,
+                            p.pool_enabled,
+                            !self.is_circuit_available(app_type, &p.id).await
+                        );
+                    } else {
+                        log::debug!(
+                            "[{app_type}] [MP-STALE] session={sid} 绑定的 provider={} 已不存在",
+                            bound.provider_id
+                        );
+                    }
+                    // 失效 → 删绑定
+                    let _ = self.db.remove_session_binding(sid);
+                }
+            }
+        }
+
+        // Layer 2: 从轮询池选 primary
+        let pool = self.load_pool(app_type).await?;
+        if pool.is_empty() {
+            log::warn!("[{app_type}] [MP-EMPTY] 多 Provider 模式开启但池为空");
+            return Err(AppError::NoProvidersConfigured);
+        }
+
+        let cfg = self.db.get_proxy_config_for_app(app_type).await?;
+        let strategy = multi_provider::PoolStrategy::from_db_str(&cfg.pool_strategy);
+        let primary = self
+            .pick_by_strategy(&pool, strategy, app_type)
+            .await?;
+        let fallbacks: Vec<Provider> = pool.into_iter().filter(|p| p.id != primary.id).collect();
+
+        // Layer 3: 写 session 绑定（短期粘性）
+        if let Some(sid) = session_id {
+            self.db
+                .upsert_session_binding(
+                    sid,
+                    app_type,
+                    &primary.id,
+                    cfg.session_ttl_seconds as i64,
+                    cfg.session_ttl_sliding,
+                )
+                .map_err(AppError::from)?;
+            log::debug!(
+                "[{app_type}] [MP-BIND] session={sid} 绑定新 provider={} (ttl={}s, sliding={})",
+                primary.id,
+                cfg.session_ttl_seconds,
+                cfg.session_ttl_sliding
+            );
+        }
+
+        let mut chain = vec![primary];
+        chain.extend(fallbacks);
+        Ok(chain)
+    }
+
+    /// 加载轮询池（pool_enabled=1 且不在熔断 Open），按 sort_index 排序
+    async fn load_pool(&self, app_type: &str) -> Result<Vec<Provider>, AppError> {
+        let all = self.db.get_all_providers(app_type)?;
+        let include_official = self.is_pool_include_official(app_type).await;
+        let mut pool: Vec<Provider> = all
+            .into_values()
+            .filter(|p| p.pool_enabled)
+            .filter(|p| {
+                // 过滤 official：除非显式 opt-in
+                p.category.as_deref() != Some("official") || include_official
+            })
+            .collect();
+        // 按 sort_index 升序（与故障队列排序一致）
+        pool.sort_by_key(|p| p.sort_index.unwrap_or(usize::MAX));
+        Ok(pool)
+    }
+
+    /// 单元素池场景：仅 primary，无 fallbacks
+    async fn load_pool_fallbacks(
+        &self,
+        app_type: &str,
+        primary_id: &str,
+    ) -> Result<Vec<Provider>, AppError> {
+        let pool = self.load_pool(app_type).await?;
+        Ok(pool.into_iter().filter(|p| p.id != primary_id).collect())
+    }
+
+    async fn is_circuit_available(&self, app_type: &str, provider_id: &str) -> bool {
+        let circuit_key = format!("{app_type}:{provider_id}");
+        let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
+        breaker.is_available().await
+    }
+
+    async fn is_pool_include_official(&self, app_type: &str) -> bool {
+        self.db
+            .get_proxy_config_for_app(app_type)
+            .await
+            .map(|c| c.pool_include_official)
+            .unwrap_or(false)
+    }
+
+    /// 拿同 session 的单飞锁
+    async fn acquire_session_lock(
+        &self,
+        app_type: &str,
+        session_id: &str,
+    ) -> Arc<tokio::sync::Mutex<()>> {
+        let key = (app_type.to_string(), session_id.to_string());
+        {
+            let map = self.session_locks.read().await;
+            if let Some(m) = map.get(&key) {
+                return m.clone();
+            }
+        }
+        let mut map = self.session_locks.write().await;
+        map.entry(key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    /// 按策略从池中选 1 个 provider
+    async fn pick_by_strategy(
+        &self,
+        pool: &[Provider],
+        strategy: multi_provider::PoolStrategy,
+        app_type: &str,
+    ) -> Result<Provider, AppError> {
+        if pool.is_empty() {
+            return Err(AppError::NoProvidersConfigured);
+        }
+        match strategy {
+            multi_provider::PoolStrategy::RoundRobin => {
+                let idx = (self.pool_counter.next(app_type) as usize) % pool.len();
+                Ok(pool[idx].clone())
+            }
+            multi_provider::PoolStrategy::WeightedRandom => {
+                // 阶段 1 简化实现：按 weight 分桶，每个 bucket 内用 counter 轮询
+                // 等同于"SWRR 的简化版"：保证 weight 比例但有抖动
+                let total: i64 = pool.iter().map(|p| p.pool_weight.max(1)).sum();
+                if total <= 0 {
+                    let idx = (self.pool_counter.next(app_type) as usize) % pool.len();
+                    return Ok(pool[idx].clone());
+                }
+                let counter = self.pool_counter.next(app_type);
+                // 用 counter 映射到 [0, total)
+                let target = (counter % total as u64) as i64;
+                let mut acc: i64 = 0;
+                for p in pool {
+                    acc += p.pool_weight.max(1);
+                    if target < acc {
+                        return Ok(p.clone());
+                    }
+                }
+                Ok(pool[pool.len() - 1].clone())
+            }
+            multi_provider::PoolStrategy::LeastFailures => {
+                let mut best = &pool[0];
+                let mut best_fail: u32 = u32::MAX;
+                for p in pool {
+                    let failures = self
+                        .db
+                        .get_provider_health(&p.id, app_type)
+                        .await
+                        .map(|h| h.consecutive_failures)
+                        .unwrap_or(0);
+                    if failures < best_fail {
+                        best = p;
+                        best_fail = failures;
+                    }
+                }
+                Ok(best.clone())
+            }
+            multi_provider::PoolStrategy::LowestLatency => {
+                // 阶段 1 简化：基于最近 N 条请求的平均 latency（无 p50 列）
+                // 若 provider 无历史数据，视为 u32::MAX（最差）
+                let mut best = &pool[0];
+                let mut best_lat: u32 = u32::MAX;
+                for p in pool {
+                    let lat = self
+                        .db
+                        .get_recent_avg_latency_ms(&p.id, app_type)
+                        .await
+                        .unwrap_or(None)
+                        .unwrap_or(u32::MAX);
+                    if lat < best_lat {
+                        best = p;
+                        best_lat = lat;
+                    }
+                }
+                Ok(best.clone())
+            }
+        }
     }
 
     /// 请求执行前获取熔断器“放行许可”
@@ -375,7 +628,7 @@ mod tests {
         db.add_to_failover_queue("claude", "b").unwrap();
 
         let router = ProviderRouter::new(db.clone());
-        let providers = router.select_providers("claude").await.unwrap();
+        let providers = router.select_providers("claude", None).await.unwrap();
 
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id, "a");
@@ -408,7 +661,7 @@ mod tests {
         db.update_proxy_config_for_app(config).await.unwrap();
 
         let router = ProviderRouter::new(db.clone());
-        let providers = router.select_providers("claude").await.unwrap();
+        let providers = router.select_providers("claude", None).await.unwrap();
 
         assert_eq!(providers.len(), 2);
         // 故障转移开启时：仅按队列顺序选择（忽略当前供应商）
@@ -440,7 +693,7 @@ mod tests {
         db.update_proxy_config_for_app(config).await.unwrap();
 
         let router = ProviderRouter::new(db.clone());
-        let providers = router.select_providers("claude").await.unwrap();
+        let providers = router.select_providers("claude", None).await.unwrap();
 
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id, "b");
@@ -483,7 +736,7 @@ mod tests {
             .await
             .unwrap();
 
-        let providers = router.select_providers("claude").await.unwrap();
+        let providers = router.select_providers("claude", None).await.unwrap();
         assert_eq!(providers.len(), 2);
 
         assert!(router.allow_provider_request("b", "claude").await.allowed);
@@ -578,7 +831,7 @@ mod tests {
 
         // 3) 旧 select_providers 行为不变（与 test_failover_disabled_uses_current_provider 一致）
         let router = ProviderRouter::new(db.clone());
-        let providers = router.select_providers("claude").await.unwrap();
+        let providers = router.select_providers("claude", None).await.unwrap();
         assert_eq!(providers.len(), 1);
         assert_eq!(providers[0].id, "a");
     }
@@ -612,5 +865,280 @@ mod tests {
         }
         // 恢复后应重新读 DB
         assert!(router.is_multi_provider_enabled("claude").await);
+    }
+
+    // ========== 阶段 1 多 Provider 模式单元测试 ==========
+
+    async fn enable_multi_provider(db: &Database, app: &str) {
+        let mut cfg = db.get_proxy_config_for_app(app).await.unwrap();
+        cfg.multi_provider_enabled = true;
+        cfg.auto_failover_enabled = true; // 强依赖
+        db.update_proxy_config_for_app(cfg).await.unwrap();
+    }
+
+    fn make_pool_provider(id: &str, sort_index: usize) -> Provider {
+        let mut p = Provider::with_id(
+            id.to_string(),
+            format!("P-{id}"),
+            json!({}),
+            None,
+        );
+        p.sort_index = Some(sort_index);
+        p.pool_enabled = true;
+        p
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_multi_provider_session_hit_returns_bound() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        let p1 = make_pool_provider("a", 1);
+        let p2 = make_pool_provider("b", 2);
+        db.save_provider("claude", &p1).unwrap();
+        db.save_provider("claude", &p2).unwrap();
+        enable_multi_provider(&db, "claude").await;
+
+        let router = ProviderRouter::new(db.clone());
+
+        // 第一次：无 session ⇒ 从池子选 primary，写 binding
+        let chain1 = router
+            .select_providers("claude", Some("sess-1"))
+            .await
+            .unwrap();
+        assert_eq!(chain1.len(), 2);
+        let primary_id_1 = chain1[0].id.clone();
+        let binding = db.get_session_binding("sess-1").unwrap().expect("bound");
+        assert_eq!(binding.provider_id, primary_id_1);
+
+        // 第二次：同 session ⇒ 命中绑定
+        let chain2 = router
+            .select_providers("claude", Some("sess-1"))
+            .await
+            .unwrap();
+        assert_eq!(chain2[0].id, primary_id_1, "session 应命中同一 provider");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_multi_provider_session_miss_picks_round_robin() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        let p1 = make_pool_provider("a", 1);
+        let p2 = make_pool_provider("b", 2);
+        let p3 = make_pool_provider("c", 3);
+        db.save_provider("claude", &p1).unwrap();
+        db.save_provider("claude", &p2).unwrap();
+        db.save_provider("claude", &p3).unwrap();
+        enable_multi_provider(&db, "claude").await;
+
+        let router = ProviderRouter::new(db.clone());
+
+        // 三个新 session 应各拿到不同 primary（轮询）
+        let c1 = router
+            .select_providers("claude", Some("s1"))
+            .await
+            .unwrap();
+        let c2 = router
+            .select_providers("claude", Some("s2"))
+            .await
+            .unwrap();
+        let c3 = router
+            .select_providers("claude", Some("s3"))
+            .await
+            .unwrap();
+
+        let ids: std::collections::HashSet<_> =
+            [c1[0].id.clone(), c2[0].id.clone(), c3[0].id.clone()]
+                .into_iter()
+                .collect();
+        assert_eq!(ids.len(), 3, "三个 session 应轮询到 3 个不同 provider");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_multi_provider_pool_empty_returns_err() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        // 没有 pool_enabled 的 provider
+        let mut p1 = Provider::with_id("a".into(), "A".into(), json!({}), None);
+        p1.pool_enabled = false;
+        db.save_provider("claude", &p1).unwrap();
+        db.set_current_provider("claude", "a").unwrap();
+
+        enable_multi_provider(&db, "claude").await;
+
+        let router = ProviderRouter::new(db.clone());
+        // 池空 ⇒ NoProvidersConfigured（不降级 legacy，legacy 同样会失败）
+        let err = router
+            .select_providers("claude", Some("s"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::NoProvidersConfigured));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_multi_provider_session_expired_rebinds() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        let p1 = make_pool_provider("a", 1);
+        let p2 = make_pool_provider("b", 2);
+        db.save_provider("claude", &p1).unwrap();
+        db.save_provider("claude", &p2).unwrap();
+        enable_multi_provider(&db, "claude").await;
+
+        let router = ProviderRouter::new(db.clone());
+        let first = router
+            .select_providers("claude", Some("s"))
+            .await
+            .unwrap();
+        let first_id = first[0].id.clone();
+
+        // 模拟过期：把 expires_at 改到 1 秒前
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE session_bindings SET expires_at = ?1 WHERE session_id = ?2",
+                rusqlite::params![crate::proxy::multi_provider::unix_now() - 1, "s"],
+            )
+            .unwrap();
+        }
+
+        // 再次请求：过期 ⇒ 重新轮询 + 重新写 binding
+        let _second = router
+            .select_providers("claude", Some("s"))
+            .await
+            .unwrap();
+        // 重新绑定后，request_count 必然 ≥ 1（说明已 UPSERT 触发）
+        let binding = db.get_session_binding("s").unwrap().expect("bound again");
+        assert!(
+            binding.request_count >= 2,
+            "重新绑定后 request_count 应增长（至少 2）"
+        );
+        // first_id 非空（说明上一轮选过 primary）
+        assert!(!first_id.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_multi_provider_session_stale_when_provider_removed() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        let p1 = make_pool_provider("a", 1);
+        let p2 = make_pool_provider("b", 2);
+        db.save_provider("claude", &p1).unwrap();
+        db.save_provider("claude", &p2).unwrap();
+        enable_multi_provider(&db, "claude").await;
+
+        let router = ProviderRouter::new(db.clone());
+        // 把 sess 绑到 a
+        router
+            .select_providers("claude", Some("s"))
+            .await
+            .unwrap();
+        // 手动把 binding 改成已删除的 provider
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE session_bindings SET provider_id = 'ghost' WHERE session_id = 's'",
+                [],
+            )
+            .unwrap();
+        }
+        // 再次请求：绑定失效 ⇒ 重新选（fallback 链不含 ghost）
+        let chain = router
+            .select_providers("claude", Some("s"))
+            .await
+            .unwrap();
+        for p in &chain {
+            assert_ne!(p.id, "ghost", "ghost provider 不应出现在 chain");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_multi_provider_official_excluded_by_default() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        let mut p1 = make_pool_provider("a", 1);
+        p1.category = Some("official".into());
+        let p2 = make_pool_provider("b", 2);
+        db.save_provider("claude", &p1).unwrap();
+        db.save_provider("claude", &p2).unwrap();
+        enable_multi_provider(&db, "claude").await;
+
+        let router = ProviderRouter::new(db.clone());
+        let chain = router
+            .select_providers("claude", Some("s"))
+            .await
+            .unwrap();
+        // 仅 b 应在池里（a 是 official 且未 opt-in）
+        assert_eq!(chain[0].id, "b");
+        assert_eq!(chain.len(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_multi_provider_official_included_when_opt_in() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        let mut p1 = make_pool_provider("a", 1);
+        p1.category = Some("official".into());
+        let p2 = make_pool_provider("b", 2);
+        db.save_provider("claude", &p1).unwrap();
+        db.save_provider("claude", &p2).unwrap();
+        enable_multi_provider(&db, "claude").await;
+        // opt-in official
+        let mut cfg = db.get_proxy_config_for_app("claude").await.unwrap();
+        cfg.pool_include_official = true;
+        db.update_proxy_config_for_app(cfg).await.unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+        let chain = router
+            .select_providers("claude", Some("s"))
+            .await
+            .unwrap();
+        // 池里有 2 个
+        assert_eq!(chain.len(), 2);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_legacy_call_with_multi_provider_disabled_goes_legacy() {
+        let _home = TempHome::new();
+        let db = Arc::new(Database::memory().unwrap());
+
+        let p1 = make_pool_provider("a", 1);
+        let p2 = make_pool_provider("b", 2);
+        db.save_provider("claude", &p1).unwrap();
+        db.save_provider("claude", &p2).unwrap();
+        // 不调 enable_multi_provider——保持 multi_provider_enabled=false（默认 legacy 路径）
+        // 但 auto_failover=true 以触发 legacy 队列分支
+        let mut cfg = db.get_proxy_config_for_app("claude").await.unwrap();
+        cfg.auto_failover_enabled = true;
+        db.update_proxy_config_for_app(cfg).await.unwrap();
+
+        // 把 a/b 加进 in_failover_queue，让 legacy 真能返回东西
+        db.add_to_failover_queue("claude", "a").unwrap();
+        db.add_to_failover_queue("claude", "b").unwrap();
+
+        let router = ProviderRouter::new(db.clone());
+        // 不设环境变量时，multi_provider_enabled=false ⇒ 走 legacy
+        let chain = router
+            .select_providers("claude", None)
+            .await
+            .unwrap();
+        // legacy 行为：按 in_failover_queue 顺序返回
+        assert_eq!(chain.len(), 2);
+        assert_eq!(chain[0].id, "a");
+        assert_eq!(chain[1].id, "b");
     }
 }

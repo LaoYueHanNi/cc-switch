@@ -101,7 +101,7 @@ pub async fn handle_claude_desktop_models(
     validate_claude_desktop_gateway_auth(&state, &headers)?;
     let providers = state
         .provider_router
-        .select_providers("claude-desktop")
+        .select_providers("claude-desktop", None)
         .await
         .map_err(|e| ProxyError::DatabaseError(e.to_string()))?;
     let provider = providers.first().ok_or(ProxyError::NoAvailableProvider)?;

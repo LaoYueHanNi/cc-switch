@@ -894,6 +894,32 @@ impl Database {
 
         Ok(())
     }
+
+    /// 同步获取 provider 的最近平均延迟（ms），用于 LowestLatency 策略
+    ///
+    /// 取最近 10 条成功请求的 `latency_ms` 平均值；无数据时返回 None。
+    /// 阶段 1 简化实现：未聚合到 usage_daily_rollups，直接从 proxy_request_logs 查。
+    pub async fn get_recent_avg_latency_ms(
+        &self,
+        provider_id: &str,
+        app_type: &str,
+    ) -> Result<Option<u32>, AppError> {
+        let conn = lock_conn!(self.conn);
+        let avg: Option<f64> = conn
+            .query_row(
+                "SELECT AVG(latency_ms) FROM (
+                    SELECT latency_ms FROM proxy_request_logs
+                    WHERE provider_id = ?1 AND app_type = ?2
+                          AND status_code BETWEEN 200 AND 299
+                    ORDER BY created_at DESC
+                    LIMIT 10
+                 )",
+                rusqlite::params![provider_id, app_type],
+                |row| row.get(0),
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(avg.map(|v| v as u32))
+    }
 }
 
 #[cfg(test)]

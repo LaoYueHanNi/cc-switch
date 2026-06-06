@@ -126,9 +126,10 @@ impl RequestContext {
 
         // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
         // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
+        // 阶段 1 改造：传 session_id 用于多 Provider 模式下的 session 粘性
         let providers = state
             .provider_router
-            .select_providers(app_type_str)
+            .select_providers(app_type_str, Some(&session_id))
             .await
             .map_err(|e| match e {
                 crate::error::AppError::AllProvidersCircuitOpen => {
