@@ -10,7 +10,34 @@ use crate::proxy::circuit_breaker::{AllowResult, CircuitBreaker, CircuitBreakerC
 use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
+
+/// 轮询计数器（per-app，纯内存，进程重启归零可接受）
+pub struct PoolCounter {
+    counters: RwLock<HashMap<String, AtomicU64>>,
+}
+
+impl PoolCounter {
+    pub fn new() -> Self {
+        Self {
+            counters: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// 获取下一个轮询索引（原子递增）
+    pub async fn next(&self, app_type: &str) -> u64 {
+        let counters = self.counters.read().await;
+        if let Some(counter) = counters.get(app_type) {
+            counter.fetch_add(1, Ordering::Relaxed)
+        } else {
+            drop(counters);
+            let mut counters = self.counters.write().await;
+            let counter = counters.entry(app_type.to_string()).or_insert_with(|| AtomicU64::new(0));
+            counter.fetch_add(1, Ordering::Relaxed)
+        }
+    }
+}
 
 /// 供应商路由器
 pub struct ProviderRouter {
@@ -18,6 +45,8 @@ pub struct ProviderRouter {
     db: Arc<Database>,
     /// 熔断器管理器 - key 格式: "app_type:provider_id"
     circuit_breakers: Arc<RwLock<HashMap<String, Arc<CircuitBreaker>>>>,
+    /// 轮询计数器
+    pool_counter: Arc<PoolCounter>,
 }
 
 impl ProviderRouter {
@@ -26,6 +55,7 @@ impl ProviderRouter {
         Self {
             db,
             circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
+            pool_counter: Arc::new(PoolCounter::new()),
         }
     }
 
@@ -108,7 +138,156 @@ impl ProviderRouter {
         Ok(result)
     }
 
-    /// 请求执行前获取熔断器“放行许可”
+    /// 选择可用的供应商（支持轮询模式）
+    ///
+    /// - `multi_provider_polling_enabled=false`：走旧逻辑（按 sort_index 顺序）
+    /// - `multi_provider_polling_enabled=true`：轮询选择 + session 粘性
+    pub async fn select_providers_with_session(
+        &self,
+        app_type: &str,
+        session_id: Option<&str>,
+    ) -> Result<Vec<Provider>, AppError> {
+        log::info!("[{app_type}] [MP-START] select_providers_with_session 入口, session_id={:?}", session_id);
+        let config = self.db.get_proxy_config_for_app(app_type).await?;
+
+        // 轮询模式关闭：走旧逻辑
+        if !config.multi_provider_polling_enabled {
+            log::info!("[{app_type}] [MP-SKIP] 轮询模式关闭，走旧逻辑");
+            return self.select_providers(app_type).await;
+        }
+
+        // 轮询模式开启
+        let session_id = session_id.ok_or_else(|| {
+            AppError::Database("轮询模式需要 session_id".to_string())
+        })?;
+        log::info!("[{app_type}] [MP-MODE] 轮询模式开启, session={}", session_id);
+
+        // 1. Session 粘性检查
+        // 绑定一旦建立就不动，除非：
+        //   ① 绑定的 provider 不存在（被删除）
+        //   ② 绑定的 provider 触发故障转移（熔断器 Open）
+        // 池的可选范围：故障队列中健康的 provider
+        if let Some(binding) = self.db.get_session_binding(session_id)? {
+            log::info!("[{app_type}] [MP-BINDING] 查 binding: app={}, provider={}",
+                binding.app_type, binding.provider_id);
+            if binding.app_type == app_type {
+                // 二次校验：provider 仍存在 + 在故障队列 + 熔断器可用
+                if let Some(provider) = self.db.get_provider_by_id(&binding.provider_id, app_type)? {
+                    if provider.in_failover_queue {
+                        let circuit_key = format!("{app_type}:{}", provider.id);
+                        let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
+                        let available = breaker.is_available().await;
+                        log::info!("[{app_type}] [MP-RECHECK] 绑定 provider={}, in_failover={}, circuit_available={}",
+                            provider.id, provider.in_failover_queue, available);
+                        if available {
+                            // 命中！复用
+                            log::info!(
+                                "[{app_type}] [MP-HIT] session={session_id} 复用 provider={}",
+                                provider.id
+                            );
+                            let fallbacks = self.load_pool_fallbacks(app_type, &provider.id).await?;
+                            return Ok(vec![provider].into_iter().chain(fallbacks).collect());
+                        } else {
+                            log::info!("[{app_type}] [MP-CB-OPEN] session={session_id} 绑定的 provider={} 熔断器 Open，触发故障转移",
+                                provider.id);
+                        }
+                    } else {
+                        log::info!("[{app_type}] [MP-NOT-IN-QUEUE] session={session_id} 绑定的 provider={} 已不在故障队列",
+                            provider.id);
+                    }
+                } else {
+                    log::info!("[{app_type}] [MP-NOT-EXIST] session={session_id} 绑定的 provider={} 已不存在",
+                        binding.provider_id);
+                }
+                // 失效（不存在 / 不在队列 / 熔断器 Open）→ 删绑定，重新选
+                log::info!("[{app_type}] [MP-STALE] session={session_id} 绑定失效，重新选");
+                let _ = self.db.remove_session_binding(session_id);
+            } else {
+                log::info!("[{app_type}] [MP-APP-MISMATCH] session={session_id} 绑定的 app_type={} 与当前 {} 不匹配",
+                    binding.app_type, app_type);
+            }
+        } else {
+            log::info!("[{app_type}] [MP-NEW] session={session_id} 无绑定，开始选择");
+        }
+
+        // 2. 从故障队列加载可用 provider（过滤熔断器 Open）
+        log::info!("[{app_type}] [MP-LOAD] 加载故障队列...");
+        let failover_queue = self.db.get_failover_queue(app_type)?;
+        log::info!("[{app_type}] [MP-LOAD] 故障队列长度: {}", failover_queue.len());
+        let mut available: Vec<Provider> = Vec::new();
+
+        for item in failover_queue {
+            if let Some(provider) = self.db.get_provider_by_id(&item.provider_id, app_type)? {
+                let circuit_key = format!("{app_type}:{}", provider.id);
+                let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
+                let is_avail = breaker.is_available().await;
+                log::info!("[{app_type}] [MP-PROVIDER] provider={}, in_failover={}, circuit_available={}",
+                    provider.id, provider.in_failover_queue, is_avail);
+                if is_avail {
+                    available.push(provider);
+                }
+            }
+        }
+        log::info!("[{app_type}] [MP-AVAIL] 可用 provider 数: {}", available.len());
+
+        if available.is_empty() {
+            log::warn!("[{app_type}] [MP-EMPTY] 轮询模式开启但故障队列为空或全部熔断");
+            return Err(AppError::NoProvidersConfigured);
+        }
+
+        // 3. Round Robin 选择 primary
+        let index = self.pool_counter.next(app_type).await % available.len() as u64;
+        let primary = available[index as usize].clone();
+        let fallbacks: Vec<Provider> = available.into_iter().filter(|p| p.id != primary.id).collect();
+
+        log::info!(
+            "[{app_type}] [MP-SELECT] session={session_id} 轮询选择 primary={}, 共 {} 个 fallback, fallback_ids={:?}",
+            primary.id,
+            fallbacks.len(),
+            fallbacks.iter().map(|p| &p.id).collect::<Vec<_>>()
+        );
+
+        // 4. 写 session 绑定（永久固定，除非 provider 失效）
+        log::info!("[{app_type}] [MP-BOUND-PRE] session={session_id} 准备写入 binding -> provider={}", primary.id);
+        match self.db.upsert_session_binding(
+            session_id,
+            app_type,
+            &primary.id,
+        ) {
+            Ok(()) => log::info!("[{app_type}] [MP-BOUND] session={session_id} -> provider={}", primary.id),
+            Err(e) => {
+                log::error!("[{app_type}] [MP-BOUND-FAIL] session={session_id} 写入 binding 失败: {e}");
+                return Err(e);
+            }
+        }
+
+        Ok(vec![primary].into_iter().chain(fallbacks).collect())
+    }
+
+    /// 加载 fallback 列表（排除 primary）
+    async fn load_pool_fallbacks(
+        &self,
+        app_type: &str,
+        primary_id: &str,
+    ) -> Result<Vec<Provider>, AppError> {
+        let failover_queue = self.db.get_failover_queue(app_type)?;
+        let mut fallbacks: Vec<Provider> = Vec::new();
+
+        for item in failover_queue {
+            if item.provider_id == primary_id {
+                continue;
+            }
+            if let Some(provider) = self.db.get_provider_by_id(&item.provider_id, app_type)? {
+                let circuit_key = format!("{app_type}:{}", provider.id);
+                let breaker = self.get_or_create_circuit_breaker(&circuit_key).await;
+                if breaker.is_available().await {
+                    fallbacks.push(provider);
+                }
+            }
+        }
+
+        Ok(fallbacks)
+    }
     ///
     /// - Closed：直接放行
     /// - Open：超时到达后切到 HalfOpen 并放行一次探测
@@ -411,7 +590,7 @@ mod tests {
         db.save_provider("claude", &provider_b).unwrap();
         db.set_current_provider("claude", "a").unwrap();
 
-        // 只把 b 加入故障转移队列（模拟“当前供应商不在队列里”的常见配置）
+        // 只把 b 加入故障转移队列（模拟"当前供应商不在队列里"的常见配置）
         db.add_to_failover_queue("claude", "b").unwrap();
 
         let mut config = db.get_proxy_config_for_app("claude").await.unwrap();

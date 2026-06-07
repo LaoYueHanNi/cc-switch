@@ -446,3 +446,73 @@ pub async fn get_circuit_breaker_stats(
     let _ = (state, provider_id, app_type);
     Ok(None)
 }
+
+/// 设置多 Provider 轮询模式
+///
+/// 开启时强制 auto_failover_enabled=true，关闭时清空 session bindings
+#[tauri::command]
+pub async fn set_multi_provider_polling(
+    state: tauri::State<'_, AppState>,
+    app_type: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut config = state
+        .db
+        .get_proxy_config_for_app(&app_type)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // 开启时强制 auto_failover=true
+    if enabled && !config.auto_failover_enabled {
+        config.auto_failover_enabled = true;
+        log::info!(
+            "[{app_type}] [MP-LINK] 开启轮询模式，自动开启 auto_failover"
+        );
+    }
+
+    config.multi_provider_polling_enabled = enabled;
+    state
+        .db
+        .update_proxy_config_for_app(config)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    // 关闭时清空 session bindings
+    if !enabled {
+        let n = state
+            .db
+            .clear_session_bindings_for_app(&app_type)
+            .map_err(|e| e.to_string())?;
+        if n > 0 {
+            log::info!(
+                "[{app_type}] [MP-CLEAR] 关闭轮询模式，清除 {n} 条 session bindings"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// 获取 session 绑定列表（调试/UI 展示）
+#[tauri::command]
+pub async fn get_session_bindings(
+    state: tauri::State<'_, AppState>,
+    app_type: String,
+) -> Result<Vec<crate::database::SessionBinding>, String> {
+    state
+        .db
+        .list_session_bindings_for_app(&app_type)
+        .map_err(|e| e.to_string())
+}
+
+/// 清空某 app 的所有 session 绑定（紧急按钮）
+#[tauri::command]
+pub async fn clear_session_bindings(
+    state: tauri::State<'_, AppState>,
+    app_type: String,
+) -> Result<usize, String> {
+    state
+        .db
+        .clear_session_bindings_for_app(&app_type)
+        .map_err(|e| e.to_string())
+}

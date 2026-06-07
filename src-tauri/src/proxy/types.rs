@@ -192,6 +192,9 @@ pub struct AppProxyConfig {
     pub circuit_error_rate_threshold: f64,
     /// 计算错误率的最小请求数
     pub circuit_min_requests: u32,
+    /// 多 Provider 轮询模式开关（复用故障队列作为轮询池）
+    #[serde(default)]
+    pub multi_provider_polling_enabled: bool,
 }
 
 /// 整流器配置

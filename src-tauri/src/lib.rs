@@ -1308,6 +1308,10 @@ pub fn run() {
             commands::get_circuit_breaker_config,
             commands::update_circuit_breaker_config,
             commands::get_circuit_breaker_stats,
+            // Multi-provider polling commands
+            commands::set_multi_provider_polling,
+            commands::get_session_bindings,
+            commands::clear_session_bindings,
             // Failover queue management
             commands::get_failover_queue,
             commands::get_available_providers_for_failover,

@@ -117,4 +117,35 @@ export const proxyApi = {
   async setPricingModelSource(appType: string, value: string): Promise<void> {
     return invoke("set_pricing_model_source", { appType, value });
   },
+
+  // ========== 多 Provider 轮询 API ==========
+
+  // 设置多 Provider 轮询模式
+  async setMultiProviderPolling(
+    appType: string,
+    enabled: boolean,
+  ): Promise<void> {
+    return invoke("set_multi_provider_polling", { appType, enabled });
+  },
+
+  // 获取 session 绑定列表
+  async getSessionBindings(appType: string): Promise<SessionBinding[]> {
+    return invoke("get_session_bindings", { appType });
+  },
+
+  // 清空 session 绑定
+  async clearSessionBindings(appType: string): Promise<number> {
+    return invoke("clear_session_bindings", { appType });
+  },
 };
+
+// Session 绑定记录
+export interface SessionBinding {
+  sessionId: string;
+  appType: string;
+  providerId: string;
+  boundAt: number;
+  expiresAt: number;
+  lastSeenAt: number;
+  requestCount: number;
+}

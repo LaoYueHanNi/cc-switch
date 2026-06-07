@@ -241,3 +241,69 @@ export function useUpdateAppProxyConfig() {
     },
   });
 }
+
+/**
+ * 设置多 Provider 轮询模式
+ */
+export function useSetMultiProviderPolling() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+
+  return useMutation({
+    mutationFn: ({ appType, enabled }: { appType: string; enabled: boolean }) =>
+      proxyApi.setMultiProviderPolling(appType, enabled),
+    onSuccess: (_, variables) => {
+      toast.success(
+        variables.enabled
+          ? t("multiProvider.toast.enabled")
+          : t("multiProvider.toast.disabled"),
+      );
+      queryClient.invalidateQueries({
+        queryKey: ["appProxyConfig", variables.appType],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["autoFailoverEnabled", variables.appType],
+      });
+      queryClient.invalidateQueries({
+        queryKey: ["failoverQueue", variables.appType],
+      });
+      queryClient.invalidateQueries({ queryKey: ["proxyStatus"] });
+    },
+    onError: (error: Error) => {
+      toast.error(t("multiProvider.toast.error", { error: error.message }));
+    },
+  });
+}
+
+/**
+ * 获取 session 绑定列表
+ */
+export function useSessionBindings(appType: string) {
+  return useQuery({
+    queryKey: ["sessionBindings", appType],
+    queryFn: () => proxyApi.getSessionBindings(appType),
+    enabled: !!appType,
+    refetchInterval: 10000, // 每 10 秒刷新
+  });
+}
+
+/**
+ * 清空 session 绑定
+ */
+export function useClearSessionBindings() {
+  const queryClient = useQueryClient();
+  const { t } = useTranslation();
+
+  return useMutation({
+    mutationFn: (appType: string) => proxyApi.clearSessionBindings(appType),
+    onSuccess: (_, appType) => {
+      toast.success(t("multiProvider.toast.bindingsCleared"));
+      queryClient.invalidateQueries({
+        queryKey: ["sessionBindings", appType],
+      });
+    },
+    onError: (error: Error) => {
+      toast.error(t("multiProvider.toast.error", { error: error.message }));
+    },
+  });
+}

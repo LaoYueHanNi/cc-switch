@@ -431,6 +431,11 @@ impl Database {
                         Self::migrate_v9_to_v10(conn)?;
                         Self::set_user_version(conn, 10)?;
                     }
+                    10 => {
+                        log::info!("迁移数据库从 v10 到 v11（简化版多 Provider 轮询）");
+                        Self::migrate_v10_to_v11(conn)?;
+                        Self::set_user_version(conn, 11)?;
+                    }
                     _ => {
                         return Err(AppError::Database(format!(
                             "未知的数据库版本 {version}，无法迁移到 {SCHEMA_VERSION}"
@@ -1197,6 +1202,97 @@ impl Database {
         }
 
         log::info!("v9 -> v10 迁移完成：已添加 Hermes Agent 支持");
+        Ok(())
+    }
+
+    /// v10 -> v11 迁移：简化版多 Provider 轮询
+    ///
+    /// 1. proxy_config 新增 multi_provider_polling_enabled 字段
+    /// 2. 创建 session_bindings 表（无 TTL，绑定永久固定）
+    /// 3. 兼容清理：如果之前版本建过含 expires_at 的旧表，用重建表方案清理
+    /// 4. 兼容清理：proxy_config.session_ttl_seconds（容错 DROP）
+    fn migrate_v10_to_v11(conn: &Connection) -> Result<(), AppError> {
+        // 1. proxy_config 新增字段
+        Self::add_column_if_missing(
+            conn,
+            "proxy_config",
+            "multi_provider_polling_enabled",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+
+        // 2. 清理可能存在的旧索引
+        let _ = conn.execute("DROP INDEX IF EXISTS idx_session_bindings_expires", []);
+
+        // 3. 处理 session_bindings 表
+        //    3a. 如果表不存在，直接创建（无 expires_at）
+        //    3b. 如果表存在但有 expires_at 列，重建表清理
+        //    3c. 如果表已存在且无 expires_at，跳过
+        let table_exists = Self::table_exists(conn, "session_bindings")?;
+        if !table_exists {
+            conn.execute(
+                "CREATE TABLE session_bindings (
+                    session_id TEXT PRIMARY KEY,
+                    app_type TEXT NOT NULL,
+                    provider_id TEXT NOT NULL,
+                    bound_at INTEGER NOT NULL,
+                    last_seen_at INTEGER NOT NULL,
+                    request_count INTEGER NOT NULL DEFAULT 1
+                )",
+                [],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        } else {
+            // 检查是否有 expires_at 列
+            let has_expires_at = conn
+                .prepare("SELECT expires_at FROM session_bindings LIMIT 0")
+                .is_ok();
+            if has_expires_at {
+                conn.execute(
+                    "CREATE TABLE session_bindings_new (
+                        session_id TEXT PRIMARY KEY,
+                        app_type TEXT NOT NULL,
+                        provider_id TEXT NOT NULL,
+                        bound_at INTEGER NOT NULL,
+                        last_seen_at INTEGER NOT NULL,
+                        request_count INTEGER NOT NULL DEFAULT 1
+                    )",
+                    [],
+                )
+                .map_err(|e| AppError::Database(e.to_string()))?;
+
+                conn.execute(
+                    "INSERT INTO session_bindings_new (session_id, app_type, provider_id, bound_at, last_seen_at, request_count)
+                     SELECT session_id, app_type, provider_id, bound_at, last_seen_at, request_count
+                     FROM session_bindings",
+                    [],
+                )
+                .map_err(|e| AppError::Database(e.to_string()))?;
+
+                conn.execute("DROP TABLE session_bindings", [])
+                    .map_err(|e| AppError::Database(e.to_string()))?;
+
+                conn.execute(
+                    "ALTER TABLE session_bindings_new RENAME TO session_bindings",
+                    [],
+                )
+                .map_err(|e| AppError::Database(e.to_string()))?;
+            }
+        }
+
+        // 4. 创建索引
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_bindings_app ON session_bindings(app_type)",
+            [],
+        )
+        .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // 5. 兼容清理：proxy_config.session_ttl_seconds（容错 DROP）
+        let _ = conn.execute(
+            "ALTER TABLE proxy_config DROP COLUMN session_ttl_seconds",
+            [],
+        );
+
+        log::info!("v10 -> v11 迁移完成：已添加多 Provider 轮询支持");
         Ok(())
     }
 

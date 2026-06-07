@@ -2298,6 +2298,24 @@
       "disabled": "Enable {{app}} failover\nSwitches to queue P1 immediately, then falls back on failures"
     }
   },
+  "multiProvider": {
+    "pollingLabel": "Polling Mode",
+    "pollingHint": "New sessions will use different providers from the queue in rotation",
+    "pollingDisabledHint": "Please enable failover first",
+    "sessionTtlLabel": "Session sticky duration (seconds)",
+    "sessionTtlHint": "Same session reuses the same provider within this duration (default 3600s)",
+    "bindingsTitle": "Session bindings ({{count}} active)",
+    "bindingsEmpty": "No active session bindings",
+    "clearAll": "Clear all bindings",
+    "clearAllConfirm": "Clear all session bindings?",
+    "requestCount": "{{count}} requests",
+    "toast": {
+      "enabled": "Polling mode enabled",
+      "disabled": "Polling mode disabled",
+      "bindingsCleared": "Session bindings cleared",
+      "error": "Operation failed: {{error}}"
+    }
+  },
   "proxy": {
     "panel": {
       "serviceAddress": "Service Address",
@@ -2415,7 +2433,7 @@
     "failoverQueue": {
       "title": "Failover Queue",
       "description": "Manage failover order for each app's providers",
-      "info": "When auto failover is enabled, requests follow the queue priority order (P1 first). On failures, the system will try the next provider in the queue.",
+      "info": "When auto failover is enabled, requests follow the queue priority order (P1 first). On failures, the system will try the next provider in the queue.\nWhen polling mode is enabled, providers are selected in round-robin order, while the failover rule still applies.",
       "selectProvider": "Select a provider to add to queue",
       "noAvailableProviders": "No providers available to add",
       "empty": "Failover queue is empty. Add providers to enable automatic failover.",

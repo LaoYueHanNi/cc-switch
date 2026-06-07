@@ -409,14 +409,18 @@ impl RequestForwarder {
             let (allowed, used_half_open_permit) = if bypass_circuit_breaker {
                 (true, false)
             } else {
+                log::info!("[{app_type_str}] [FW-CB] 请求熔断器放行: provider={}", provider.id);
                 let permit = self
                     .router
                     .allow_provider_request(&provider.id, app_type_str)
                     .await;
+                log::info!("[{app_type_str}] [FW-CB] 熔断器返回: provider={}, allowed={}, used_half_open={}",
+                    provider.id, permit.allowed, permit.used_half_open_permit);
                 (permit.allowed, permit.used_half_open_permit)
             };
 
             if !allowed {
+                log::warn!("[{app_type_str}] [FW-CB] provider={} 被熔断器拒绝, 跳过", provider.id);
                 continue;
             }
 

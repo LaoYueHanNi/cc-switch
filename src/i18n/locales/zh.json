@@ -2298,6 +2298,24 @@
       "disabled": "启用 {{app}} 故障转移\n将立即切换到队列 P1，并在失败时自动切换到下一个"
     }
   },
+  "multiProvider": {
+    "pollingLabel": "轮询模式",
+    "pollingHint": "新 session 将轮流使用队列中的不同 provider",
+    "pollingDisabledHint": "请先开启故障转移",
+    "sessionTtlLabel": "Session 粘性时长（秒）",
+    "sessionTtlHint": "同一 session 在此时长内复用同一个 provider（默认 3600 秒）",
+    "bindingsTitle": "Session 绑定（{{count}} 个活跃）",
+    "bindingsEmpty": "暂无活跃的 session 绑定",
+    "clearAll": "清空所有绑定",
+    "clearAllConfirm": "确定清空所有 session 绑定吗？",
+    "requestCount": "{{count}} 次请求",
+    "toast": {
+      "enabled": "轮询模式已开启",
+      "disabled": "轮询模式已关闭",
+      "bindingsCleared": "Session 绑定已清空",
+      "error": "操作失败: {{error}}"
+    }
+  },
   "proxy": {
     "panel": {
       "serviceAddress": "服务地址",
@@ -2415,7 +2433,7 @@
     "failoverQueue": {
       "title": "故障转移队列",
       "description": "管理各应用的供应商故障转移顺序",
-      "info": "启用自动故障转移后，将按队列优先级选择供应商（P1 优先）。当请求失败时，系统会按队列顺序依次尝试下一个供应商。",
+      "info": "启用自动故障转移后，将按队列优先级选择供应商（P1 优先）。当请求失败时，系统会按队列顺序依次尝试下一个供应商。\n启用轮询模式后，将按队列顺序轮询选择供应商，同时故障转移规则适用。",
       "selectProvider": "选择供应商添加到队列",
       "noAvailableProviders": "没有可添加的供应商",
       "empty": "故障转移队列为空。添加供应商以启用自动故障转移。",

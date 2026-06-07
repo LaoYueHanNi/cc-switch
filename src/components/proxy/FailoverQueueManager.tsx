@@ -31,6 +31,10 @@ import {
   useAutoFailoverEnabled,
   useSetAutoFailoverEnabled,
 } from "@/lib/query/failover";
+import {
+  useAppProxyConfig,
+  useSetMultiProviderPolling,
+} from "@/lib/query/proxy";
 
 interface FailoverQueueManagerProps {
   appType: AppId;
@@ -48,6 +52,10 @@ export function FailoverQueueManager({
   const { data: isFailoverEnabled = false } = useAutoFailoverEnabled(appType);
   const setFailoverEnabled = useSetAutoFailoverEnabled();
 
+  // 轮询模式相关
+  const { data: appConfig } = useAppProxyConfig(appType);
+  const setPolling = useSetMultiProviderPolling();
+
   // 查询数据
   const {
     data: queue,
@@ -64,6 +72,11 @@ export function FailoverQueueManager({
   // 切换故障转移开关
   const handleToggleFailover = (enabled: boolean) => {
     setFailoverEnabled.mutate({ appType, enabled });
+  };
+
+  // 切换轮询模式
+  const handleTogglePolling = (enabled: boolean) => {
+    setPolling.mutate({ appType, enabled });
   };
 
   // 添加供应商到队列
@@ -152,10 +165,36 @@ export function FailoverQueueManager({
         />
       </div>
 
+      {/* 轮询模式开关 */}
+      <div className="flex items-center justify-between p-4 rounded-lg bg-muted/50 border border-border/50">
+        <div className="space-y-0.5">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium">
+              {t("multiProvider.pollingLabel")}
+            </span>
+            {appConfig?.multiProviderPollingEnabled && (
+              <span className="px-2 py-0.5 text-xs rounded-full bg-blue-500/20 text-blue-600 dark:text-blue-400">
+                {t("common.enabled", { defaultValue: "已开启" })}
+              </span>
+            )}
+          </div>
+          <p className="text-xs text-muted-foreground">
+            {isFailoverEnabled
+              ? t("multiProvider.pollingHint")
+              : t("multiProvider.pollingDisabledHint")}
+          </p>
+        </div>
+        <Switch
+          checked={appConfig?.multiProviderPollingEnabled ?? false}
+          onCheckedChange={handleTogglePolling}
+          disabled={disabled || !isFailoverEnabled || setPolling.isPending}
+        />
+      </div>
+
       {/* 说明信息 */}
       <Alert className="border-blue-500/40 bg-blue-500/10">
         <Info className="h-4 w-4" />
-        <AlertDescription className="text-sm">
+        <AlertDescription className="text-sm whitespace-pre-line">
           {t(
             "proxy.failoverQueue.info",
             "队列顺序与首页供应商列表顺序一致。当请求失败时，系统会按顺序依次尝试队列中的供应商。",

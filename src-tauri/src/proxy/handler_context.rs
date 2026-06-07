@@ -126,9 +126,10 @@ impl RequestContext {
 
         // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
         // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
+        // 支持轮询模式：根据 session_id 选择不同的 provider
         let providers = state
             .provider_router
-            .select_providers(app_type_str)
+            .select_providers_with_session(app_type_str, Some(&session_id))
             .await
             .map_err(|e| match e {
                 crate::error::AppError::AllProvidersCircuitOpen => {
