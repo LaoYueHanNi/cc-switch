@@ -65,6 +65,9 @@ impl ProviderRouter {
     /// - 故障转移关闭时：仅返回当前供应商
     /// - 故障转移开启时：仅使用故障转移队列，按队列顺序依次尝试（P1 → P2 → ...）
     pub async fn select_providers(&self, app_type: &str) -> Result<Vec<Provider>, AppError> {
+        log::info!(
+            "[{app_type}] [MP-LEGACY] select_providers 入口（不走 session 路径）"
+        );
         let mut result = Vec::new();
         let mut total_providers = 0usize;
         let mut circuit_open_count = 0usize;
@@ -135,6 +138,11 @@ impl ProviderRouter {
             }
         }
 
+        log::info!(
+            "[{app_type}] [MP-LEGACY-RESULT] 选中 {} 个 provider: {:?}",
+            result.len(),
+            result.iter().map(|p| &p.id).collect::<Vec<_>>()
+        );
         Ok(result)
     }
 
@@ -145,9 +153,9 @@ impl ProviderRouter {
     pub async fn select_providers_with_session(
         &self,
         app_type: &str,
-        session_id: Option<&str>,
+        session_id: &str,
     ) -> Result<Vec<Provider>, AppError> {
-        log::info!("[{app_type}] [MP-START] select_providers_with_session 入口, session_id={:?}", session_id);
+        log::info!("[{app_type}] [MP-START] select_providers_with_session 入口, session_id={}", session_id);
         let config = self.db.get_proxy_config_for_app(app_type).await?;
 
         // 轮询模式关闭：走旧逻辑
@@ -157,9 +165,6 @@ impl ProviderRouter {
         }
 
         // 轮询模式开启
-        let session_id = session_id.ok_or_else(|| {
-            AppError::Database("轮询模式需要 session_id".to_string())
-        })?;
         log::info!("[{app_type}] [MP-MODE] 轮询模式开启, session={}", session_id);
 
         // 1. Session 粘性检查

@@ -145,7 +145,6 @@ export interface SessionBinding {
   appType: string;
   providerId: string;
   boundAt: number;
-  expiresAt: number;
   lastSeenAt: number;
   requestCount: number;
 }

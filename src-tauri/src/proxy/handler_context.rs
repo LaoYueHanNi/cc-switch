@@ -97,6 +97,12 @@ impl RequestContext {
             .await
             .map_err(|e| ProxyError::DatabaseError(e.to_string()))?;
 
+        log::info!(
+            "[{}] [CTX-CONFIG] app={}, multi_provider_polling_enabled={}, auto_failover_enabled={}, max_retries={}",
+            tag, app_type_str, app_config.multi_provider_polling_enabled,
+            app_config.auto_failover_enabled, app_config.max_retries
+        );
+
         // 从数据库读取整流器配置
         let rectifier_config = state.db.get_rectifier_config().unwrap_or_default();
         let optimizer_config = state.db.get_optimizer_config().unwrap_or_default();
@@ -127,9 +133,13 @@ impl RequestContext {
         // 使用共享的 ProviderRouter 选择 Provider（熔断器状态跨请求保持）
         // 注意：只在这里调用一次，结果传递给 forwarder，避免重复消耗 HalfOpen 名额
         // 支持轮询模式：根据 session_id 选择不同的 provider
+        log::info!(
+            "[{}] [CTX-SELECT] 调用 select_providers_with_session: app={}, session={} (client_provided={})",
+            tag, app_type_str, session_id, session_result.client_provided
+        );
         let providers = state
             .provider_router
-            .select_providers_with_session(app_type_str, Some(&session_id))
+            .select_providers_with_session(app_type_str, &session_id)
             .await
             .map_err(|e| match e {
                 crate::error::AppError::AllProvidersCircuitOpen => {
@@ -144,12 +154,13 @@ impl RequestContext {
             .cloned()
             .ok_or(ProxyError::NoAvailableProvider)?;
 
-        log::debug!(
-            "[{}] Provider: {}, model: {}, failover chain: {} providers, session: {}",
+        log::info!(
+            "[{}] [CTX-RESULT] Provider={}, model={}, failover_chain_len={}, provider_ids={:?}, session={}",
             tag,
             provider.name,
             request_model,
             providers.len(),
+            providers.iter().map(|p| &p.id).collect::<Vec<_>>(),
             session_id
         );
 
