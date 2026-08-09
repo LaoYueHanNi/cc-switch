@@ -73,6 +73,8 @@ pub struct RequestContext {
     pub copilot_optimizer_config: CopilotOptimizerConfig,
     /// Stack 模型的请求（`mode::stack`）：直达 Stack 里的那一家，不读也不写任何路由状态。
     pub is_stack: bool,
+    /// 跳过 usage 日志记录（count_tokens 等辅助接口设为 true）
+    pub skip_usage_log: bool,
 }
 
 impl RequestContext {
@@ -221,6 +223,7 @@ impl RequestContext {
             optimizer_config,
             copilot_optimizer_config,
             is_stack,
+            skip_usage_log: false,
         })
     }
 
