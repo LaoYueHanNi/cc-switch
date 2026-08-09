@@ -236,7 +236,7 @@ pub async fn handle_non_streaming(
     );
 
     // 解析并记录使用量。关闭 usage logging 时直接跳过，避免非流式响应整包 JSON parse。
-    if usage_logging_enabled(state) {
+    if usage_logging_enabled(state) && !ctx.skip_usage_log {
         if let Ok(json_value) = serde_json::from_slice::<Value>(&body_bytes) {
             // 解析使用量
             if let Some(usage) = (parser_config.response_parser)(&json_value) {

@@ -70,6 +70,8 @@ pub struct RequestContext {
     pub optimizer_config: OptimizerConfig,
     /// Copilot 优化器配置
     pub copilot_optimizer_config: CopilotOptimizerConfig,
+    /// 跳过 usage 日志记录（count_tokens 等辅助接口设为 true）
+    pub skip_usage_log: bool,
 }
 
 impl RequestContext {
@@ -173,6 +175,7 @@ impl RequestContext {
             rectifier_config,
             optimizer_config,
             copilot_optimizer_config,
+            skip_usage_log: false,
         })
     }
 

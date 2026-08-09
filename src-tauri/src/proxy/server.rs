@@ -305,6 +305,10 @@ impl ProxyServer {
                 "/claude-desktop/v1/messages",
                 post(handlers::handle_claude_desktop_messages),
             )
+            .route(
+                "/claude-desktop/v1/messages/count_tokens",
+                post(handlers::handle_claude_desktop_count_tokens),
+            )
             // OpenAI Chat Completions API (Codex CLI，支持带前缀和不带前缀)
             .route("/chat/completions", post(handlers::handle_chat_completions))
             .route(
