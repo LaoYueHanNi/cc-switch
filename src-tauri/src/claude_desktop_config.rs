@@ -1034,7 +1034,10 @@ fn build_gateway_profile(
         "inferenceGatewayApiKey": api_key,
         "inferenceGatewayAuthScheme": "bearer",
         "inferenceGatewayBaseUrl": base_url,
-        "inferenceProvider": "gateway"
+        "inferenceProvider": "gateway",
+        "toolSearchEnabled": true,
+        "disableBundledSkills": true,
+        "chatTabEnabled": true
     });
 
     if let Some(model_specs) = model_specs {
@@ -1510,6 +1513,8 @@ mod tests {
         assert_eq!(profile["inferenceGatewayAuthScheme"], json!("bearer"));
         assert_eq!(profile["disableDeploymentModeChooser"], json!(true));
         assert_eq!(profile["coworkEgressAllowedHosts"], json!(["*"]));
+        assert_eq!(profile["toolSearchEnabled"], json!(true));
+        assert_eq!(profile["disableBundledSkills"], json!(true));
         assert!(profile.get("inferenceModels").is_none());
         assert_eq!(meta["appliedId"], json!(PROFILE_ID));
         assert!(meta["entries"]
