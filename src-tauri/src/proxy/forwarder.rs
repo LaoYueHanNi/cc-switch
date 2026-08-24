@@ -1182,6 +1182,8 @@ impl RequestForwarder {
             && !provider.is_codex_oauth()
             && !provider.is_xai_oauth();
 
+        let is_count_tokens = is_count_tokens_endpoint(endpoint);
+
         // GitHub Copilot API 使用 /chat/completions（无 /v1 前缀）
         let is_copilot = provider
             .meta
@@ -1255,7 +1257,12 @@ impl RequestForwarder {
         };
 
         // 与 CCH 对齐：请求前不做 thinking 主动改写（仅保留兼容入口）
-        let mut mapped_body = normalize_thinking_type(mapped_body);
+        // count_tokens 透传：跳过 thinking 类型规范，保留客户端原始 body。
+        let mut mapped_body = if is_count_tokens {
+            mapped_body
+        } else {
+            normalize_thinking_type(mapped_body)
+        };
 
         // Grok Build exposes a stable client-side model profile in config.toml.
         // Route requests to the provider's real upstream model before applying
@@ -1426,7 +1433,7 @@ impl RequestForwarder {
         } else {
             None
         };
-        if adapter.name() == "Claude" {
+        if adapter.name() == "Claude" && !is_count_tokens {
             if let Some(api_format) = resolved_claude_api_format.as_deref() {
                 super::providers::normalize_anthropic_messages_for_provider(
                     &mut mapped_body,
@@ -1436,9 +1443,15 @@ impl RequestForwarder {
                 self.apply_media_prevention(&mut mapped_body, provider);
             }
         }
-        let needs_transform = match resolved_claude_api_format.as_deref() {
-            Some(api_format) => super::providers::claude_api_format_needs_transform(api_format),
-            None => adapter.needs_transform(provider),
+        let needs_transform = if is_count_tokens {
+            false
+        } else {
+            match resolved_claude_api_format.as_deref() {
+                Some(api_format) => {
+                    super::providers::claude_api_format_needs_transform(api_format)
+                }
+                None => adapter.needs_transform(provider),
+            }
         };
         // Codex → Anthropic: Claude Code emulation is off by default and only
         // enabled when the user explicitly turns it on in the UI, so requests can
@@ -1485,7 +1498,12 @@ impl RequestForwarder {
             .then(|| CodexStandaloneEndpoint::from_effective_endpoint(&effective_endpoint))
             .flatten();
 
-        let url = if matches!(resolved_claude_api_format.as_deref(), Some("gemini_native")) {
+        let url = if is_count_tokens
+            && (is_full_url || codex_anthropic_base_is_full_endpoint)
+            && base_url_is_full_endpoint(&base_url, "/v1/messages")
+        {
+            rewrite_full_messages_url_to_count_tokens(&base_url, passthrough_query.as_deref())
+        } else if matches!(resolved_claude_api_format.as_deref(), Some("gemini_native")) {
             super::gemini_url::resolve_gemini_native_url(
                 &base_url,
                 &effective_endpoint,
@@ -2963,6 +2981,30 @@ fn strip_beta_query(query: Option<&str>) -> Option<String> {
 
 fn is_claude_messages_path(path: &str) -> bool {
     matches!(path, "/v1/messages" | "/claude/v1/messages")
+}
+
+fn is_count_tokens_endpoint(endpoint: &str) -> bool {
+    let (path, _) = split_endpoint_and_query(endpoint);
+    matches!(
+        path,
+        "/v1/messages/count_tokens" | "/claude/v1/messages/count_tokens"
+    )
+}
+
+/// 把 full-url 形态的 `.../v1/messages` 改写为 `.../v1/messages/count_tokens`，
+/// 保留原 URL 上的 query / fragment，并合并额外透传 query。
+fn rewrite_full_messages_url_to_count_tokens(
+    base_url: &str,
+    extra_query: Option<&str>,
+) -> String {
+    let trimmed = base_url.trim();
+    let (path_part, suffix) = match trimmed.find(['?', '#']) {
+        Some(idx) => (&trimmed[..idx], &trimmed[idx..]),
+        None => (trimmed, ""),
+    };
+    let path = path_part.trim_end_matches('/');
+    let rewritten = format!("{path}/count_tokens{suffix}");
+    append_query_to_full_url(&rewritten, extra_query)
 }
 
 fn rewrite_codex_responses_endpoint_to_chat(endpoint: &str) -> (String, Option<String>) {
@@ -5491,5 +5533,44 @@ mod tests {
         });
         let body = body_with_image("any-model");
         assert!(fwd.media_retry_should_trigger("Claude", false, &body, &image_unsupported_error()));
+    }
+
+    #[test]
+    fn is_count_tokens_endpoint_matches_known_paths() {
+        assert!(is_count_tokens_endpoint("/v1/messages/count_tokens"));
+        assert!(is_count_tokens_endpoint(
+            "/claude/v1/messages/count_tokens"
+        ));
+        assert!(is_count_tokens_endpoint(
+            "/v1/messages/count_tokens?beta=true"
+        ));
+        assert!(!is_count_tokens_endpoint("/v1/messages"));
+        assert!(!is_count_tokens_endpoint("/v1/messages/count"));
+        assert!(!is_count_tokens_endpoint("/chat/completions"));
+    }
+
+    #[test]
+    fn rewrite_full_messages_url_to_count_tokens_preserves_query() {
+        assert_eq!(
+            rewrite_full_messages_url_to_count_tokens(
+                "https://relay.example/api/v1/messages",
+                None
+            ),
+            "https://relay.example/api/v1/messages/count_tokens"
+        );
+        assert_eq!(
+            rewrite_full_messages_url_to_count_tokens(
+                "https://relay.example/api/v1/messages?beta=true",
+                Some("x=1")
+            ),
+            "https://relay.example/api/v1/messages/count_tokens?beta=true&x=1"
+        );
+        assert_eq!(
+            rewrite_full_messages_url_to_count_tokens(
+                "https://relay.example/api/v1/messages/",
+                None
+            ),
+            "https://relay.example/api/v1/messages/count_tokens"
+        );
     }
 }

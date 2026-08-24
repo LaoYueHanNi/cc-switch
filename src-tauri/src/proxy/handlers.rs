@@ -147,6 +147,112 @@ pub async fn handle_claude_desktop_messages(
     .await
 }
 
+pub async fn handle_claude_desktop_count_tokens(
+    State(state): State<ProxyState>,
+    request: axum::extract::Request,
+) -> Result<axum::response::Response, ProxyError> {
+    validate_claude_desktop_gateway_auth(&state, request.headers())?;
+
+    let (parts, body) = request.into_parts();
+    let method = parts.method.clone();
+    let uri = parts.uri;
+    let headers = parts.headers;
+    let extensions = parts.extensions;
+    let body_bytes = body
+        .collect()
+        .await
+        .map_err(|e| ProxyError::Internal(format!("Failed to read request body: {e}")))?
+        .to_bytes();
+    let body: Value = serde_json::from_slice(&body_bytes)
+        .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
+
+    let model = body.get("model").and_then(|m| m.as_str()).unwrap_or("?");
+    let msg_count = body.get("messages").and_then(|m| m.as_array()).map(|a| a.len()).unwrap_or(0);
+    log::debug!("[count_tokens] >>> 请求: model={model}, messages={msg_count}");
+
+    let mut ctx = RequestContext::new(
+        &state,
+        &body,
+        &headers,
+        AppType::ClaudeDesktop,
+        "Claude Desktop",
+        "claude-desktop",
+    )
+    .await?;
+
+    ctx.skip_usage_log = true;
+
+    let raw_endpoint = uri
+        .path_and_query()
+        .map(|path_and_query| path_and_query.as_str())
+        .unwrap_or(uri.path());
+    let endpoint = raw_endpoint
+        .strip_prefix("/claude-desktop")
+        .unwrap_or(raw_endpoint);
+
+    let provider_id = ctx.provider.id.clone();
+    let provider_name = ctx.provider.name.clone();
+
+    // 热缓存：供应商曾返回 404 时直接 fallback，不再重复探测
+    if crate::proxy::count_intercept::is_count_tokens_unsupported(&provider_id) {
+        log::debug!("[count_tokens] >>> {provider_name} 缓存命中（不支持 count_tokens），直接 fallback");
+        return Ok(
+            crate::proxy::count_intercept::handle_count_tokens_fallback(&body),
+        );
+    }
+
+    let forwarder = ctx.create_forwarder(&state);
+    match forwarder
+        .forward_with_retry(
+            &AppType::ClaudeDesktop,
+            method,
+            endpoint,
+            body.clone(),
+            headers,
+            extensions,
+            ctx.get_providers(),
+        )
+        .await
+    {
+        Ok(mut result) => {
+            let status = result.response.status();
+            // 上游不支持 count_tokens（404/405 等）时 fallback 到本地估算
+            if !status.is_success() {
+                ctx.outbound_model = result.outbound_model.take();
+                ctx.provider = result.provider;
+                crate::proxy::count_intercept::mark_count_tokens_unsupported(&provider_id);
+                log::debug!("[count_tokens] <<< 上游 {provider_name} 返回 {status} → fallback 本地估算");
+                return Ok(
+                    crate::proxy::count_intercept::handle_count_tokens_fallback(&body),
+                );
+            }
+            let connection_guard = result.connection_guard.take();
+            ctx.outbound_model = result.outbound_model.take();
+            ctx.provider = result.provider;
+            let out_model = ctx.outbound_model.as_deref().unwrap_or(&ctx.request_model);
+            log::debug!("[count_tokens] <<< 上游 {provider_name} 成功 ({status}), model={out_model}");
+            process_response(
+                result.response,
+                &ctx,
+                &state,
+                &CLAUDE_PARSER_CONFIG,
+                connection_guard,
+            )
+            .await
+        }
+        Err(mut err) => {
+            if let Some(provider) = err.provider.take() {
+                ctx.provider = provider;
+            }
+            crate::proxy::count_intercept::mark_count_tokens_unsupported(&provider_id);
+            log::debug!("[count_tokens] <<< 上游 {provider_name} 请求失败: {} → fallback 本地估算", err.error);
+            Ok(crate::proxy::count_intercept::handle_count_tokens_fallback(
+                &body,
+            ))
+        }
+    }
+}
+
 pub async fn handle_claude_desktop_models(
     State(state): State<ProxyState>,
     headers: axum::http::HeaderMap,
@@ -183,6 +289,15 @@ async fn handle_messages_for_app(
         .to_bytes();
     let body: Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| ProxyError::Internal(format!("Failed to parse request body: {e}")))?;
+
+    // Claude Desktop token 预算估算（count）请求拦截：本地估算 input_tokens 直接
+    // 返回，不转发上游（上游如 DeepSeek 不理解 count 语义，会当真推理浪费 token）。
+    // 仅对 Claude Desktop 生效；claude CLI / codex 的请求不受影响。
+    if matches!(app_type, AppType::ClaudeDesktop) {
+        if let Some(response) = crate::proxy::count_intercept::handle_count_intercept(&body) {
+            return Ok(response);
+        }
+    }
 
     let mut ctx =
         RequestContext::new(&state, &body, &headers, app_type.clone(), tag, app_type_str).await?;
