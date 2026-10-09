@@ -1505,6 +1505,7 @@ impl RequestForwarder {
             conversation_fingerprint(&mapped_body)
         } else {
             None
+        };
 
         // Grok Build exposes a stable client-side model profile in config.toml.
         // Route requests to the provider's real upstream model before applying

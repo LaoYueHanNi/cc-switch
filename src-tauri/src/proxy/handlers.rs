@@ -294,6 +294,7 @@ pub async fn handle_claude_desktop_count_tokens(
         AppType::ClaudeDesktop,
         "Claude Desktop",
         "claude-desktop",
+        None,
     )
     .await?;
 
@@ -353,6 +354,7 @@ pub async fn handle_claude_desktop_count_tokens(
                 &ctx,
                 &state,
                 &CLAUDE_PARSER_CONFIG,
+                false,
                 connection_guard,
             )
             .await
