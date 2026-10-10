@@ -456,15 +456,15 @@ impl Database {
                 log::warn!("Periodic stream_check_logs cleanup failed: {e}");
             }
         }
-        // Disabled: keep all detailed request logs permanently
-        // match self.rollup_and_prune(30) {
-        //     Ok(deleted) => {
-        //         reclaimed_rows += deleted;
-        //     }
-        //     Err(e) => {
-        //         log::warn!("Periodic rollup_and_prune failed: {e}");
-        //     }
-        // }
+        // retain=3000d (~8 年)，实际等同于永久保留明细
+        match self.rollup_and_prune(3000) {
+            Ok(deleted) => {
+                reclaimed_rows += deleted;
+            }
+            Err(e) => {
+                log::warn!("Periodic rollup_and_prune failed: {e}");
+            }
+        }
         if reclaimed_rows > 0 {
             let conn = lock_conn!(self.conn);
             if let Err(e) = Self::incremental_vacuum_on_conn(&conn) {

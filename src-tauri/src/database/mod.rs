@@ -153,10 +153,10 @@ impl Database {
         if let Err(e) = db.cleanup_old_stream_check_logs(7) {
             log::warn!("Startup stream_check_logs cleanup failed: {e}");
         }
-        // Disabled: keep all detailed request logs permanently
-        // if let Err(e) = db.rollup_and_prune(30) {
-        //     log::warn!("Startup rollup_and_prune failed: {e}");
-        // }
+        // retain=3000d (~8 年)，实际等同于永久保留明细
+        if let Err(e) = db.rollup_and_prune(3000) {
+            log::warn!("Startup rollup_and_prune failed: {e}");
+        }
         // Reclaim disk space after cleanup
         {
             let conn = lock_conn!(db.conn);
